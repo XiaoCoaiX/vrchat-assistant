@@ -177,7 +177,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
   - 失败 / 超时 / 非 2xx / 队列满 / 任务超时 → `WARN`（前缀 `[api]` 或 `[ext]`），同时写 `ops_log`（kind `api` / `ext`），文案含服务、操作、原因、耗时、必要时第几次；
   - 降级 / 兜底 / 缓存命中 / 跳过（前置条件不满足）→ `INFO`（前缀 `[ext]`），同时写 `ops_log`；
   - 成功 → `debug`（>2000ms 的慢调用自动升 `INFO`：成功但慢才是信号）；
-  - 实现走**单一来源** `core/ext-log.js`（`logExtFailure` / `logExtFallback` / `logExtSuccess` / `getExtStats`）；插件禁止 `import core/`，改用 `api.extLog.failure/fallback/success`（见 PLUGIN-API §7）；
+  - 实现走**单一来源** `core/ext-log.js`（`logExtFailure` / `logExtFallback` / `logExtSuccess` / `getExtStats`）；插件禁止 `import core/`，改用 `api.extLog.failure/fallback/success`（见 PLUGIN-API §4.7）；
   - 聚合快照经 `GET /health` 的 `api` 字段暴露（`client` 调用统计 + `ext` 外部服务失败统计），明细用 `get_ops_log`（`kind=api|ext`）查；新增外部调用点若不留痕，评审按阻断项处理。
 - **插件第三方依赖**：`plugins/official/*` 中带 `package.json` 的插件（目前 emoji-notes 依赖 pinyin-pro）需先执行 `npm run install-plugins`（CI 已在 `npm ci` 后运行此步）。本地/审查环境只跑 `npm ci` 会漏装插件依赖，表现为此类插件整体加载失败、`test/test-registry.mjs` 工具数少于 `core/tool-order.json`（如 105/108）——先补装插件依赖再跑测试，勿误判为代码回归。
 - **测试日志隔离（两条路径，绝不写生产日志目录）**：① `npm test`（package.json 的 test script）通过 `--import ./test/setup-log-isolation.mjs` 把 `VRC_MONITOR_LOGGER_DIR` 钉到每次运行唯一的系统临时目录——显式隔离；② 裸 `node --test`（不经 npm script）只有 `core/logger.js` `resolveDir()` 的 `NODE_TEST_CONTEXT` 单点兜底（node --test 子进程会设 `NODE_TEST_CONTEXT`，日志落到 `os.tmpdir()/vrc-monitor-test-logs`）。两条路径都不会写进生产日志目录 `<VRC_MONITOR_DIR>/logs`（曾实测 96 行 `wrld_kbtest-*` 测试夹具污染生产日志，后修复）。

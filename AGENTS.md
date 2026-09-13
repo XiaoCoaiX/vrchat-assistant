@@ -101,7 +101,7 @@
 - `VRC_MONITOR_LOGGER_SUPPRESS`：逗号分隔子串列表，命中即整条丢弃（如 `ping,keepalive` 压 MCP 保活噪音）。
 - `VRC_MONITOR_LOGGER_CONSOLE`：是否同时写 stdout（默认 `1`；`0` 仅写文件，一般不建议）。
 - `VRC_MONITOR_LOGGER_COLOR`：text 格式是否加 ANSI 色（默认 `auto`，写文件永无色）。
-- `VRC_MONITOR_LOG_API_SUCCESS`：设为 `1` 时**成功的 API 调用也记 INFO**（默认关闭——成功且快的调用只落 debug，避免逐条刷屏）。慢调用（>2000ms）无论该开关如何都会升格 INFO。
+- `VRC_MONITOR_LOG_API_SUCCESS`：设为 `1` 时**成功的 API 调用也记 INFO**（默认关闭——成功且快的调用只落 debug，避免逐条刷屏）。慢调用（>2000ms）无论该开关如何都会升格 INFO。**开启后会明显放大日志量，仅供临时排障**，建议配合 `VRC_MONITOR_LOGGER_SUPPRESS` 或改完即关。
 - `VRC_MONITOR_API_BASE`：**测试/调试开关**，覆盖 VRChat REST 基址（生产默认 `https://api.vrchat.cloud/api/1`）。只接受 `https` 或**回环 http**（`127.0.0.1` / `localhost` / `[::1]`，用于本地 stub）；非回环 `http://` 一律忽略并留一行 WARN（明文网关会泄露 auth cookie）。
 - `VRC_MONITOR_API_TIMEOUT_MS`：**测试/调试开关**，覆盖单请求 socket 空闲超时（生产默认 `15000`ms）。
 - **外部调用留痕规范**（PR 外部调用可观测性）：`[api]` = VRChat REST 调用，`[ext]` = 外部服务（PlanetVRC / X / BOOTH / Google Calendar / IMAP-OTP）。分级固定为「失败/超时/非 2xx → WARN；降级/兜底/缓存命中/跳过 → INFO；成功 → debug（>2000ms 升 INFO）」，且同一时间同步写入 ops_log（`kind='api'|'ext'`，`get_ops_log` 可查、保留 500 条）；聚合快照见 `GET /health` 的 `api` 字段（`api.client` / `api.ext` / `rateLimiter`）。新增外部调用点必须逐分支留痕，禁止静默降级。

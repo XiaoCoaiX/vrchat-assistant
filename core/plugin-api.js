@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { logExtFailure, logExtFallback, logExtSuccess } from './ext-log.js';
 
 /**
- * Plugin API v1 — 为插件提供与核心交互的 6 个 API 表面。
+ * Plugin API v1 — 为插件提供与核心交互的 API 表面（**清单与语义以 `docs/PLUGIN-API.md` §4 为权威**，
+ * 此处不写死数量，避免与文档的双轨计数）。
  *
  * buildPluginApi(pluginName, { registry, ctx, services, serviceOwners, log })
  */

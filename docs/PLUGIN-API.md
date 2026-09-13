@@ -74,7 +74,9 @@ export default function register(api) {
 
 插件代码只准通过 `api` 对象与核心交互。**禁止** import 核心内部模块、触碰 `ctx`、直连数据库文件——见 §7 禁止事项。
 
-## 4. API 表面（v1-experimental 共 6 个）
+## 4. API 表面（v1-experimental 共 7 个）
+
+> **计数纪律**：本行数字与本节条目必须同步（新增/移除 API 面时一并改），Changelog 记版本行——避免与代码注释形成双轨。`#187`（`api.health`）合入后需再同步一次计数与条目。
 
 ### 4.1 api.registerTool(def) — 注册一个 MCP 工具
 
@@ -172,6 +174,24 @@ const digest = await api.consume("query_digest", wrld_xxx);
 - **职责划分**：共享「查询/逻辑」→ `provide/consume`；共享「能力但需要完整 MCP 语义或参数校验」→ `api.tools.call`（§4.5）。**对外暴露给客户端的工具，永远用 `registerTool`，不因 provide/consume 而绕过**。
 - 能力探测：`api.hasService(name)` 查询某服务是否已提供（配合 §2 区分「插件没装」vs「版本不兼容」）。
 
+### 4.7 api.extLog — 外部服务调用留痕（failure / fallback / success）
+
+插件抓取**非 VRChat 官方**的外部站点（PlanetVRC / BOOTH / Google Calendar / 任意第三方 API）时，必须用本面留痕，保证「失败 / 降级兜底 / 跳过错」在日志与运维日志里各留一行（禁静默降级）：
+
+```js
+api.extLog.failure("BOOTH", "抓取搜索结果页", err, { durationMs, attempt });
+api.extLog.fallback("BOOTH", "读取商品 123", "本地缓存命中，跳过远端抓取");
+api.extLog.success("BOOTH", "抓取搜索结果页", { durationMs });
+```
+
+- **分级固定**（与核心 `[api]`/`[ext]` 留痕同口径）：`failure` → `WARN` + `ops_log(kind='ext', level='warn')`；`fallback` → `INFO` + `ops_log('ext','info')`（覆盖缓存命中 / 降级 / 跳过 / 部分失败保留旧数据）；`success` → `debug`（**>2000ms 的慢调用自动升 INFO**——成功但慢才是信号，快成功默认静默，避免逐条刷屏）。
+- **一次触发恰好一行**：每个抓取点都要在「成功 / 失败 / 跳过 / 兜底」各分支调用对应函数，不允许静默返回；实现为**单一来源** `core/ext-log.js`（插件经本面调用，不得 `import core/`，见 §7）。
+- 文案由核心拼装（`服务 操作 失败: 原因（耗时 Xms）`），插件只提供 `service` / `op` / `err` / `reason`；错误信息会被压成单行并截断（防换行注入、防日志爆行）。
+- `durationMs` 建议用 `Date.now()` 差值得出；`attempt` 用于表达「第 N 次」重试。
+- **勿把凭据写进 `op`/`reason`**（如 IMAP 授权码、cookie）——本面会整条落盘并进 ops_log。
+- 聚合快照见 `GET /health` 的 `api.ext`（failures / fallbacks / slow / topFailures ≤5）；明细检索 `get_ops_log(kind='ext')`。
+- 旧核心能力探测：老版本核心不提供本面，插件应写 `api.extLog?.failure?.(...)` 降级为 `api.log(...)`（官方 planet/booth 插件即此写法）。
+
 ## 5. 生命周期与热加载
 
 1. **加载**：服务启动时扫描全部插件目录 → 校验清单（含 `depends` 拓扑排序：被依赖者优先加载；依赖缺失 → 拒绝加载该插件并报错指引；依赖环 → 拒绝加载并报环）→ 执行 schema.sql → 调用 `register(api)`（若是 Promise 则 await）。加载失败（语法错误/校验失败/注册冲突）只禁用该插件，日志给出修复指引，服务与其他插件正常。
@@ -267,6 +287,7 @@ export default function register(api) {
 
 ## Changelog
 
+- **v1.3 (2026-09-13)**：新增 §4.7 `api.extLog`（外部服务调用留痕：`failure`/`fallback`/`success`，失败与降级同步写 `ops_log(kind='ext')`）；§4 计数同步为 **7 个 API**（计数以 §4 为准）；配套核心 `[api]`/`[ext]` 留痕规范见 `AGENTS.md` 环境变量清单末条的说明。
 - **v1.2 (2026-09-05)**：放开插件第三方库限制，落地「插件自带 package.json」依赖机制。
 - **v1.0 (2026-08-23)**：初始契约（registerTool / db / vrchat.fetch / log / tools.call 共 5 个 API）。
 - **v1.1 (2026-08-23)**：experimental 化；新增 §4.6 `api.provide/consume`（共 6 个 API）+ `api.tools.has`/`api.hasService` 能力探测；§4.2 改显式表句柄 + schema 只增不删约定；§4.1 补 destructive 对偶拦截 / outputSchema 扩展位 / 逻辑隔离定性；§2 补 depends 能力探测与加载期环检测＋破坏性前缀校验；§5 补热加载不中断 + schema 版本可见；§7 补敏感文件/env/加密存储禁读 + loader 静态扫描；凭据入库加密（核心基建，随 PR 演进）。
