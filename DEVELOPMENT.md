@@ -20,7 +20,7 @@
 
 本仓库的**贡献模型**在 PR-3「解冻」后正式切换为**插件优先**：
 
-- **新功能一律做成插件**：功能贡献者先读 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)（插件开发指南）与 [docs/PLUGIN-API.md](./docs/PLUGIN-API.md)（契约 v1.2），在 `plugins/official/<name>/`（随主仓发布）或 `plugins/local/<name>/`（用户私有）里新建一个插件文件夹，经 `register(api)` + `api.registerTool` 暴露 MCP 工具。可复制 [docs/plugin-template/](./docs/plugin-template/) 模板起步。**功能代码不得进 `core/`、不得改核心运行时、不得触碰 `ctx`。** 官方插件可带自身 `package.json` 声明第三方依赖（契约 v1.2，见 docs/PLUGIN-API.md §6.1），原生依赖仍受 §3.3 约束。
+- **新功能一律做成插件**：功能贡献者先读 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)（插件开发指南）与 [docs/PLUGIN-API.md](./docs/PLUGIN-API.md)（契约 v1.3），在 `plugins/official/<name>/`（随主仓发布）或 `plugins/local/<name>/`（用户私有）里新建一个插件文件夹，经 `register(api)` + `api.registerTool` 暴露 MCP 工具。可复制 [docs/plugin-template/](./docs/plugin-template/) 模板起步。**功能代码不得进 `core/`、不得改核心运行时、不得触碰 `ctx`。** 官方插件可带自身 `package.json` 声明第三方依赖（契约 v1.3，见 docs/PLUGIN-API.md §6.1），原生依赖仍受 §3.3 约束。
 - **核心（`core/`）只收两类改动**：① bug/缺陷修复；②底盘演进（插件运行所需的基础设施，如 `plugin-loader.js` / `plugin-api.js` / `registry.js` / 核心服务注册表 `registerCoreServices()` 的能力扩展）。核心不收「某个具体业务功能的实现」。
 - **新增工具需登记注册名**：插件经 `api.registerTool` 注册的工具，只有其名字在 `core/tool-order.json` 中才会出现在 `tools/list`（`registry.listTools()` 只按该清单遍历）。新增功能工具时，把工具名补进 `core/tool-order.json` 属于「底座演进」类改动，一并随插件 PR 提交（并同步登记进 `skills/vrc-monitor-agent/SKILL.md`「MCP 工具」权威清单）。
 - **三件套（持续演进）**：核心工具（`core/tools/*`，自声明 `tools` 数组、经 `core/registry.js` 注册）＋ 插件（`plugins/official/*`，默认导出 `register(api)`、经 `api.registerTool` 注册）＋ 核心注册表（`core/registry.js`）统一并入 `listTools()` 输出。核心工具走 `ctx`，插件一律走 `api.*`，两者最终对 Agent 呈现为同一套 MCP 工具。
