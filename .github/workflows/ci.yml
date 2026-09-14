@@ -13,8 +13,11 @@ name: CI
 #
 # ⚠️ 命名与收录（issue #190）：`npm test` 的 glob 只收 `*.test.mjs`（带 .test 段）；
 #    `test-*.mjs` 是独立套件、不会被 npm test 收录——要进门禁必须像下面这样显式加一步。
-#    反之，`test-apis.mjs` / `test-websocket.mjs` / `test-ws-direct.mjs` / `test-fetch-x-worlds*.mjs`
-#    依赖真实凭据或外网，**不得**加入 CI。
+#    反之，以下套件**不得**加入 CI（理由具体到依赖，防止后来者「为了让 CI 更全」把它们塞进来
+#    而把门禁做成随机红绿）：
+#      · test-apis.mjs / test-websocket.mjs / test-ws-direct.mjs —— 需真实 VRChat 凭据（credentials.json / auth cookie）
+#      · test-websocket.mjs / test-ws-direct.mjs —— 另有 120s 固定监听 + 127.0.0.1:7892 代理依赖
+#      · test-fetch-x-worlds.mjs / test-fetch-x-worlds-browser.mjs —— 抓取 X（外网），且 browser 版依赖 playwright
 #
 # 刻意不接入任何真实凭据：本仓库所有自动化测试只能覆盖「无凭据也能验证」的部分，
 # 涉及真实 VRChat 登录的验证仍由作者人工完成（见 DEVELOPMENT.md「测试与 CI」）。
