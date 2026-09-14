@@ -83,6 +83,17 @@ jq -r 'select(.level=="error") | "\(.ts) [\(.name)] \(.msg)"' "$VRC_MONITOR_LOGG
 
 单文件达到 `MAX_SIZE` 时自动轮转压缩为 `.gz`，命名形如 `monitor-YYYYMMDD-HHMMSS-<pid>.log.gz`，最多保留 `MAX_FILES` 份。
 
+## 🐦 X 博主世界推荐（可选）
+
+想让自己关注的 X 博主推荐的 VRChat 世界自动进库（`x_scan_creators` / `x_world_digest` 系列工具），需要一个 X 登录态的 cookie：
+
+1. 浏览器登录 x.com，用 Cookie-Editor 之类的扩展**导出全部 cookie**（至少包含 `auth_token` 与 `ct0`）；
+2. 存成单行文本写入 `<仓库>/data/x_cookie.txt`（该目录已被 .gitignore 排除，不会提交）；
+3. 重启服务即可，`x_scan_creators` 会自动优先走 X 站内接口。
+
+> 为什么需要 cookie：Nitter 公共实例 2026 年起被反爬墙大面积拦截、X 的匿名搜索接口返回 404，只有登录态能稳定取到博主的时间线；未配置时该通道降级失败但**不影响其他功能**。
+> cookie 数月会过期，届时按同样步骤重新导出即可（报错会明确提示「cookie 失效」）。也可以在仓库根 `.env` 里用 `VRC_MONITOR_X_COOKIE_FILE` 指定别的路径。
+
 ## 🛠 故障排查
 
 **Q: WebSocket 连不上？**
