@@ -13,7 +13,7 @@
 
 import { ctx, log } from './server-context.js';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { logExtFailure, logExtFallback } from './ext-log.js';
+import { logExtFailure, logExtFallback, logExtSuccess } from './ext-log.js';
 import https from 'node:https';
 import http from 'node:http';
 import zlib from 'node:zlib';
@@ -39,6 +39,30 @@ const MAX_TWEETS_PER_CREATOR = 20; // Nitter RSS 固定返回最近 ~20 条
 // 用 guest token 可拉取完整推文流（product=Latest，count=20 可翻页），作为 Nitter 失败时的兜底。
 // 注：X API 同样会限流/轮换 queryId，故只作降级兜底，不替代 Nitter。
 const X_BEARER_TOKEN = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+
+/**
+ * screen_name → rest_id 内存缓存。
+ * rest_id 稳定不变，缓存后可把「每博主每轮 2 次 GraphQL」降为 1 次（降低用户账号被 X 风控的面）。
+ */
+const X_USER_ID_CACHE = new Map();
+
+/** 归一化 screen_name：容忍调用方带 @ 前缀（否则日志出现 @@foo，请求也可能 404） */
+function normalizeScreenName(screenName) {
+  return String(screenName || '').trim().replace(/^@+/, '');
+}
+
+/**
+ * X API 429 退避窗口：一旦某个博主撞上 429，窗口内不再对 X 发请求（扫描器跳过后续博主），
+ * 避免用用户本人账号持续撞限流。窗口时长可用 VRC_MONITOR_X_RATE_LIMIT_BACKOFF_MS 覆盖（默认 5 分钟）。
+ */
+let _xRateLimitedUntil = 0;
+const X_RATE_LIMIT_BACKOFF_MS = parseInt(process.env.VRC_MONITOR_X_RATE_LIMIT_BACKOFF_MS, 10) || 5 * 60 * 1000;
+
+/** 当前是否处于 X 429 退避窗口（扫描器用；返回 true 时应跳过 X API 请求） */
+export function isXRateLimited() {
+  return Date.now() < _xRateLimitedUntil;
+}
+
 // SearchTimeline queryId 会被 X 定期轮换，故支持环境变量覆盖（无需改代码）
 const X_SEARCH_QUERY_ID = process.env.VRC_MONITOR_X_SEARCH_QUERY_ID || 'hyPfJYJ_XAtDYoslQc-Rgg';
 const X_SEARCH_FEATURES = {
@@ -464,6 +488,9 @@ async function loadXCookie() {
  * UserTweets 需要 userId 而非 screen_name，故先查一次。
  */
 async function resolveXUserId(screenName) {
+  screenName = normalizeScreenName(screenName);
+  const cachedId = X_USER_ID_CACHE.get(screenName.toLowerCase());
+  if (cachedId) return cachedId;
   const cookie = await loadXCookie();
   if (!cookie) {
     const e = new Error('X API cookie 未配置');
@@ -488,7 +515,22 @@ async function resolveXUserId(screenName) {
     timeoutMs: 20000,
   });
   if (resp.status !== 200) {
-    const e = new Error(`X UserByScreenName 失败：HTTP ${resp.status}`);
+    if (resp.status === 401 || resp.status === 403) {
+      const e = new Error(`X API cookie 失效（HTTP ${resp.status}，@${screenName}），请重新导出浏览器 cookie 到 data/x_cookie.txt`);
+      e.code = 'X_API_UNREACHABLE';
+      throw e;
+    }
+    if (resp.status === 429) {
+      const e = new Error(`X API 触达速率限制（HTTP 429，@${screenName}）：请稍后重试或降低扫描频率（可增大 VRC_MONITOR_X_CREATOR_DELAY_MS）`);
+      e.code = 'X_API_RATE_LIMITED';
+      throw e;
+    }
+    if (resp.status === 404) {
+      const e = new Error(`X UserByScreenName 端点 404（@${screenName}）——queryId 可能已轮换，请更新环境变量 VRC_MONITOR_X_USERBYSCREENNAME_QUERY_ID`);
+      e.code = 'X_API_UNREACHABLE';
+      throw e;
+    }
+    const e = new Error(`X UserByScreenName 失败：HTTP ${resp.status}（@${screenName}）`);
     e.code = 'X_API_UNREACHABLE';
     throw e;
   }
@@ -500,6 +542,7 @@ async function resolveXUserId(screenName) {
     e.code = 'X_API_UNREACHABLE';
     throw e;
   }
+  X_USER_ID_CACHE.set(screenName.toLowerCase(), userId);
   return userId;
 }
 
@@ -548,6 +591,8 @@ export function parseUserTweetsTimeline(obj, screenName) {
  * - 网络/代理不可达：FETCH_FAILED
  */
 export async function fetchCreatorViaXApi(screenName) {
+  screenName = normalizeScreenName(screenName);
+  const startedAt = Date.now();
   const cookie = await loadXCookie();
   if (!cookie) {
     const e = new Error('X API cookie 未配置（需设置 VRC_MONITOR_X_COOKIE 或放置 data/x_cookie.txt）');
@@ -600,6 +645,11 @@ export async function fetchCreatorViaXApi(screenName) {
     err.code = 'X_API_UNREACHABLE';
     throw err;
   }
+  if (resp.status === 429) {
+    const err = new Error(`X API 触达速率限制（HTTP 429，@${screenName}）：请稍后重试或降低扫描频率（可增大 VRC_MONITOR_X_CREATOR_DELAY_MS）`);
+    err.code = 'X_API_RATE_LIMITED';
+    throw err;
+  }
   if (resp.status === 404) {
     const err = new Error(`X UserTweets 端点 404（@${screenName}）——queryId 可能已轮换，请更新环境变量 VRC_MONITOR_X_USERTWEETS_QUERY_ID`);
     err.code = 'X_API_UNREACHABLE';
@@ -624,6 +674,8 @@ export async function fetchCreatorViaXApi(screenName) {
     err.code = 'X_API_UNREACHABLE';
     throw err;
   }
+  // 成功留痕（#191 规范：外部调用逐分支恰好一行；>2000ms 自动升格 INFO）
+  logExtSuccess('X', `@${screenName} UserTweets 抓取`, { durationMs: Date.now() - startedAt });
   return tweets;
 }
 
@@ -1212,6 +1264,11 @@ export async function fetchCreatorTweets(screenName, { minTweets = 0 } = {}) {
   } catch (e) {
     if (e.code === 'X_API_UNREACHABLE' && /cookie 未配置/i.test(e.message)) {
       log(`x-world @${screenName} X API 通道未配置 cookie，跳过`);
+    } else if (e.code === 'X_API_RATE_LIMITED') {
+      // 429 = 用自己账号高频抓最容易先撞上的错误：进退避窗口（本轮后续博主不再打 X），其余通道与 X 无关照常兜底
+      _xRateLimitedUntil = Date.now() + X_RATE_LIMIT_BACKOFF_MS;
+      log(`[警告] x-world @${screenName} X API 触达速率限制(429)，进入 ${Math.round(X_RATE_LIMIT_BACKOFF_MS / 1000)}s 退避窗口（本轮不再打 X API）`);
+      logExtFallback('X', `@${screenName} X API 抓取`, `429 速率限制，本轮回退其他通道并退避：${e.message}`);
     } else {
       log(`[警告] x-world @${screenName} X API 通道失败，回退后续通道：${e.message}`);
       logExtFallback('X', `@${screenName} X API 抓取`, `失败回退后续通道：${e.message}`);
@@ -1334,9 +1391,17 @@ export async function scanCreatorWorlds({ force = false } = {}) {
   const results = [];
   let totalTweets = 0;
   let totalWorlds = 0;
+  // 博主间节流：X API 的请求以「用户本人账号」发出，逐博主串行无间隔 = 一轮 N 次突发（风控面）
+  const creatorDelayMs = parseInt(process.env.VRC_MONITOR_X_CREATOR_DELAY_MS, 10) || 1200;
 
   for (const creator of creators) {
     const screen = creator.screen_name;
+    if (isXRateLimited()) {
+      log(`[警告] x-world scan @${screen} 跳过：X API 处于 429 退避窗口（本轮不再打用户账号）`);
+      results.push({ screen_name: screen, name: creator.name || screen, tweets: 0, worlds: 0, skipped: 'x_rate_limited' });
+      continue;
+    }
+    if (results.length > 0) await sleep(creatorDelayMs);
     try {
       const { tweets } = await fetchCreatorTweets(screen);
       totalTweets += tweets.length;

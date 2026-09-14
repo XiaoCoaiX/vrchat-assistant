@@ -1,5 +1,5 @@
-// 测试 X API UserTweets 通道：离线解析器单测 + 真实网络调用
-import { parseUserTweetsTimeline, extractWorldsFromTweetText, extractWorldIdsFromLinks, fetchCreatorViaXApi, fetchCreatorTweets } from '../core/fetch-x-worlds.js';
+// X API UserTweets 通道：真实网络抓取 + 通道集成测试（需 data/x_cookie.txt；离线解析器单测见 x-api-channel.test.mjs）
+import { fetchCreatorViaXApi, fetchCreatorTweets } from '../core/fetch-x-worlds.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -13,136 +13,8 @@ function assert(label, cond) {
   else { fail++; console.log(`  ✗ ${label}`); }
 }
 
-// ── Part A: 离线解析器单测 ──────────────────────────────────
-console.log('=== A. parseUserTweetsTimeline 离线单测 ===');
-
-const mockTimeline = {
-  data: {
-    user: {
-      result: {
-        __typename: 'User',
-        rest_id: '2148219258',
-        timeline: {
-          timeline: {
-            instructions: [
-              {
-                type: 'TimelineAddEntries',
-                entries: [
-                  {
-                    entryId: 'tweet-1001',
-                    sortIndex: '1001',
-                    content: {
-                      entryType: 'TimelineTimelineItem',
-                      itemContent: {
-                        itemContent: {
-                          tweet_results: {
-                            result: {
-                              __typename: 'Tweet',
-                              rest_id: '1001',
-                              core: { user_results: { result: { rest_id: '2148219258' } } },
-                              legacy: {
-                                id_str: '1001',
-                                created_at: 'Fri Oct 04 12:00:00 +0000 2019',
-                                full_text: 'This is a pinned tweet from 2019 with no world info',
-                                entities: { urls: [], media: [] },
-                              },
-                            },
-                          },
-                        },
-                      },
-                    },
-                  },
-                  {
-                    entryId: 'tweet-2002',
-                    sortIndex: '2002',
-                    content: {
-                      entryType: 'TimelineTimelineItem',
-                      itemContent: {
-                        itemContent: {
-                          tweet_results: {
-                            result: {
-                              __typename: 'Tweet',
-                              rest_id: '2002',
-                              core: { user_results: { result: { rest_id: '2148219258' } } },
-                              legacy: {
-                                id_str: '2002',
-                                created_at: 'Sun Sep 14 02:19:43 +0000 2026',
-                                full_text: 'World name: Noise ⁄ ノイズ\nBy: Dal\nPlatform: PC\n#VRChat #VRChat_world紹介 https://t.co/bkQXCpgrPO',
-                                entities: {
-                                  urls: [],
-                                  media: [{ expanded_url: 'https://pbs.twimg.com/media/screenshot.jpg' }],
-                                },
-                              },
-                            },
-                          },
-                        },
-                      },
-                    },
-                  },
-                  {
-                    entryId: 'tweet-3003',
-                    sortIndex: '3003',
-                    content: {
-                      entryType: 'TimelineTimelineItem',
-                      itemContent: {
-                        itemContent: {
-                          tweet_results: {
-                            result: {
-                              __typename: 'Tweet',
-                              rest_id: '3003',
-                              core: { user_results: { result: { rest_id: '2148219258' } } },
-                              note_tweet: {
-                                note_tweet_results: {
-                                  result: {
-                                    text: 'World name: Tranquility Lane （Fallout 3）\nBy: ControVR\nPlatform: PC & Quest\nThis is a very long tweet that exceeds the legacy full_text limit and requires note_tweet expansion to read the complete content. The world is amazing and you should try it!',
-                                  },
-                                },
-                              },
-                              legacy: {
-                                id_str: '3003',
-                                created_at: 'Sat Sep 13 10:00:00 +0000 2026',
-                                full_text: 'World name: Tranquility Lane （Fallout 3）\nBy: ControVR\nPlatform: PC & Quest\nThis is a very long tweet that exceeds the legacy…',
-                                entities: { urls: [], media: [] },
-                              },
-                            },
-                          },
-                        },
-                      },
-                    },
-                  },
-                ],
-              },
-            ],
-          },
-        },
-      },
-    },
-  },
-};
-
-const tweets = parseUserTweetsTimeline(mockTimeline, 'Bradlee1011');
-
-assert(`解析出 3 条推文（含 pinned 旧推）`, tweets.length === 3);
-
-const byId = Object.fromEntries(tweets.map(t => [t.id, t]));
-
-assert('推文 1001 (pinned) id 正确', byId['1001']?.id === '1001');
-assert('推文 1001 time 为 ISO 格式', byId['1001']?.time === new Date('Fri Oct 04 12:00:00 +0000 2019').toISOString());
-assert('推文 1001 url 格式正确', byId['1001']?.url === 'https://x.com/Bradlee1011/status/1001');
-
-assert('推文 2002 世界名解析', byId['2002']?.worldNames.some(n => n.includes('Noise')));
-assert('推文 2002 作者解析', byId['2002']?.authorName === 'Dal');
-assert('推文 2002 time ISO 格式', byId['2002']?.time === new Date('Sun Sep 14 02:19:43 +0000 2026').toISOString());
-
-assert('推文 3003 (note_tweet) 使用长文本', byId['3003']?.text.includes('complete content'));
-assert('推文 3003 世界名从 note_tweet 解析', byId['3003']?.worldNames.some(n => n.includes('Tranquility Lane')));
-assert('推文 3003 作者从 note_tweet 解析', byId['3003']?.authorName === 'ControVR');
-
-const sorted = [...tweets].sort((a, b) => new Date(b.time) - new Date(a.time));
-assert('按时间排序后最新为推文 2002', sorted[0].id === '2002');
-assert('pinned 旧推排在最后', sorted[sorted.length - 1].id === '1001');
-
-console.log(`\n  离线单测结果：${pass} pass / ${fail} fail\n`);
+// 注：解析器离线单测已迁至 test/x-api-channel.test.mjs（带 .test 段，进 npm test / CI 门禁，issue #190）；
+//     本文件保留需要真实网络与 cookie 的用例（Part B 真实抓取 / Part C 通道集成），手动运行。
 
 // ── Part B: 真实网络调用测试 ──────────────────────────────────
 console.log('=== B. 真实网络调用 @Bradlee1011 ===');
