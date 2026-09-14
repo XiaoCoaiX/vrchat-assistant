@@ -17,6 +17,7 @@ import { logExtFailure, logExtFallback } from './ext-log.js';
 import https from 'node:https';
 import http from 'node:http';
 import zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
 
 // Nitter 实例列表（按实测可达性排序：nitter.net 本机实测可用，其余为回退）
 const NITTER_INSTANCES = [
@@ -394,6 +395,236 @@ function findBottomCursor(obj) {
     }
   }
   return null;
+}
+
+// ── X API UserTweets 通道（cookie 鉴权，2026-09 新增）─────────
+// 背景：Nitter 全实例被反爬墙（Anubis/403）、X SearchTimeline 匿名访问整体返回 404，
+// 用用户浏览器导出的登录 cookie 直调 X 站内 GraphQL UserTweets 可绕过上述限制。
+// queryId 会被 X 定期轮换，支持环境变量覆盖（无需改代码）。
+const X_USERTWEETS_QUERY_ID = process.env.VRC_MONITOR_X_USERTWEETS_QUERY_ID || 'OeFjWKHutsuyWXZGmLr02A';
+const X_USERBYSCREENNAME_QUERY_ID = process.env.VRC_MONITOR_X_USERBYSCREENNAME_QUERY_ID || 'KybxDj9RrADIITXlGG8kpw';
+const X_USERTWEETS_FEATURES = {
+  'rweb_video_screen_enabled': false,
+  'payments_enabled': false,
+  'profile_label_improvements_pcf_label_in_post_enabled': true,
+  'rweb_tipjar_consumption_enabled': true,
+  'verified_phone_label_enabled': false,
+  'creator_subscriptions_tweet_preview_api_enabled': true,
+  'responsive_web_graphql_timeline_navigation_enabled': true,
+  'responsive_web_graphql_skip_user_profile_image_extensions_enabled': false,
+  'premium_content_api_read_enabled': false,
+  'communities_web_enable_tweet_community_results_fetch': true,
+  'c9s_tweet_anatomy_moderator_badge_enabled': true,
+  'responsive_web_grok_analyze_button_fetch_trends_enabled': false,
+  'responsive_web_grok_analyze_post_followups_enabled': true,
+  'responsive_web_jetfuel_frame': false,
+  'responsive_web_grok_share_attachment_enabled': true,
+  'articles_preview_enabled': true,
+  'responsive_web_edit_tweet_api_enabled': true,
+  'graphql_is_translatable_rweb_tweet_is_translatable_enabled': true,
+  'view_counts_everywhere_api_enabled': true,
+  'longform_notetweets_consumption_enabled': true,
+  'responsive_web_twitter_article_tweet_consumption_enabled': true,
+  'tweet_awards_web_tipping_enabled': false,
+  'responsive_web_grok_show_grok_translated_post': false,
+  'responsive_web_grok_analysis_button_from_backend': true,
+  'creator_subscriptions_quote_tweet_preview_enabled': false,
+  'freedom_of_speech_not_reach_fetch_enabled': true,
+  'standardized_nudges_misinfo': true,
+  'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled': true,
+  'longform_notetweets_rich_text_read_enabled': true,
+  'longform_notetweets_inline_media_enabled': true,
+  'responsive_web_grok_image_annotation_enabled': true,
+  'responsive_web_grok_community_note_auto_translation_is_enabled': false,
+  'responsive_web_enhance_cards_enabled': false,
+};
+
+/**
+ * 加载 X API cookie（按优先级：env 直传 → env 文件路径 → 默认文件）。
+ * 缺 auth_token 或 ct0 返回 null（视为未配置，静默跳过通道）。
+ * 安全红线：cookie 绝不进日志。
+ */
+async function loadXCookie() {
+  const env = process.env;
+  let cookie = env.VRC_MONITOR_X_COOKIE || '';
+  if (!cookie) {
+    const filePath = env.VRC_MONITOR_X_COOKIE_FILE || '';
+    const defaultPath = filePath || fileURLToPath(new URL('../data/x_cookie.txt', import.meta.url));
+    try {
+      const fs = await import('node:fs');
+      cookie = fs.readFileSync(defaultPath, 'utf-8').trim();
+    } catch { return null; }
+  }
+  if (!cookie.includes('auth_token=') || !cookie.includes('ct0=')) return null;
+  return cookie;
+}
+
+/**
+ * 通过 UserByScreenName 解析 userId（rest_id）。
+ * UserTweets 需要 userId 而非 screen_name，故先查一次。
+ */
+async function resolveXUserId(screenName) {
+  const cookie = await loadXCookie();
+  if (!cookie) {
+    const e = new Error('X API cookie 未配置');
+    e.code = 'X_API_UNREACHABLE';
+    throw e;
+  }
+  const ct0Match = cookie.match(/ct0=([A-Za-z0-9_-]+)/);
+  const ct0 = ct0Match ? ct0Match[1] : '';
+  const variables = { screen_name: screenName, withSafetyModeUserFields: true };
+  const url = `https://x.com/i/api/graphql/${X_USERBYSCREENNAME_QUERY_ID}/UserByScreenName?variables=${encodeURIComponent(JSON.stringify(variables))}&features=${encodeURIComponent(JSON.stringify(X_USERTWEETS_FEATURES))}&fieldToggles=${encodeURIComponent(JSON.stringify({ withAuxiliaryUserLabels: true }))}`;
+  const resp = await tryFetchWithProxy(url, {
+    headers: {
+      'User-Agent': UA,
+      'Authorization': `Bearer ${X_BEARER_TOKEN}`,
+      'Cookie': cookie,
+      'x-csrf-token': ct0,
+      'x-twitter-auth-type': 'OAuth2Session',
+      'x-twitter-active-user': 'yes',
+      'x-twitter-client-language': 'ja',
+      'Referer': 'https://x.com/',
+    },
+    timeoutMs: 20000,
+  });
+  if (resp.status !== 200) {
+    const e = new Error(`X UserByScreenName 失败：HTTP ${resp.status}`);
+    e.code = 'X_API_UNREACHABLE';
+    throw e;
+  }
+  let obj;
+  try { obj = JSON.parse(resp.body); } catch { obj = null; }
+  const userId = obj?.data?.user?.result?.rest_id;
+  if (!userId) {
+    const e = new Error(`X UserByScreenName 响应缺少 rest_id（@${screenName}）`);
+    e.code = 'X_API_UNREACHABLE';
+    throw e;
+  }
+  return userId;
+}
+
+/**
+ * 递归遍历 UserTweets timeline instructions，收集推文。
+ * 返回 [{ id, url, time (ISO), text, worldIds, worldNames, authorName }]。
+ * 含 note_tweet 长推文支持（优先于 legacy.full_text）。
+ */
+export function parseUserTweetsTimeline(obj, screenName) {
+  const tweets = [];
+  const seen = new Set();
+  function walk(o) {
+    if (!o || typeof o !== 'object') return;
+    if (Array.isArray(o)) { for (const item of o) walk(item); return; }
+    const lg = o.legacy;
+    if (lg && typeof lg === 'object' && lg.id_str && !seen.has(lg.id_str)) {
+      const fullText = o.note_tweet?.note_tweet_results?.result?.text || lg.full_text;
+      if (fullText) {
+        seen.add(lg.id_str);
+        const url = `https://x.com/${screenName}/status/${lg.id_str}`;
+        const time = lg.created_at ? new Date(lg.created_at).toISOString() : null;
+        const parsed = extractWorldsFromTweetText(fullText);
+        const links = [];
+        if (lg.entities) {
+          for (const u of lg.entities.urls || []) { if (u.expanded_url) links.push(u.expanded_url); }
+          for (const m of lg.entities.media || []) { if (m.expanded_url) links.push(m.expanded_url); }
+        }
+        const worldIds = [...new Set([...parsed.worldIds, ...extractWorldIdsFromLinks(links)])];
+        tweets.push({ id: lg.id_str, url, time, text: fullText, worldIds, worldNames: parsed.worldNames, authorName: parsed.authorName });
+      }
+    }
+    for (const v of Object.values(o)) walk(v);
+  }
+  walk(obj);
+  return tweets;
+}
+
+/**
+ * 通过 X GraphQL UserTweets 端点抓取博主推文（cookie 鉴权）。
+ * 返回结构与 fetchCreatorRss / fetchCreatorViaBrowser 一致。
+ * 失败时 err.code = 'X_API_UNREACHABLE'，消息含 HTTP 状态码。
+ *
+ * 错误区分：
+ * - 401/403：cookie 失效（需用户重新导出）
+ * - 404：queryId 轮换（需更新环境变量）
+ * - 网络/代理不可达：FETCH_FAILED
+ */
+export async function fetchCreatorViaXApi(screenName) {
+  const cookie = await loadXCookie();
+  if (!cookie) {
+    const e = new Error('X API cookie 未配置（需设置 VRC_MONITOR_X_COOKIE 或放置 data/x_cookie.txt）');
+    e.code = 'X_API_UNREACHABLE';
+    throw e;
+  }
+
+  const userId = await resolveXUserId(screenName);
+  const ct0Match = cookie.match(/ct0=([A-Za-z0-9_-]+)/);
+  const ct0 = ct0Match ? ct0Match[1] : '';
+
+  const variables = {
+    userId,
+    count: 20,
+    includePromotedContent: false,
+    withQuickPromoteEligibilityTweetFields: false,
+    withVoice: false,
+    withV2Timeline: true,
+  };
+  const fieldToggles = { withArticlePlainText: false };
+  const url = `https://x.com/i/api/graphql/${X_USERTWEETS_QUERY_ID}/UserTweets?variables=${encodeURIComponent(JSON.stringify(variables))}&features=${encodeURIComponent(JSON.stringify(X_USERTWEETS_FEATURES))}&fieldToggles=${encodeURIComponent(JSON.stringify(fieldToggles))}`;
+
+  let resp;
+  try {
+    resp = await tryFetchWithProxy(url, {
+      headers: {
+        'User-Agent': UA,
+        'Authorization': `Bearer ${X_BEARER_TOKEN}`,
+        'Cookie': cookie,
+        'x-csrf-token': ct0,
+        'x-twitter-auth-type': 'OAuth2Session',
+        'x-twitter-active-user': 'yes',
+        'x-twitter-client-language': 'ja',
+        'Referer': 'https://x.com/',
+      },
+      timeoutMs: 20000,
+    });
+  } catch (e) {
+    const isProxy = e.code === 'FETCH_FAILED';
+    const msg = isProxy
+      ? `X UserTweets 网络/代理不可达（@${screenName}）：${e.message}`
+      : `X UserTweets 请求异常（@${screenName}）：${e.message}`;
+    const err = new Error(msg);
+    err.code = 'X_API_UNREACHABLE';
+    throw err;
+  }
+
+  if (resp.status === 401 || resp.status === 403) {
+    const err = new Error(`X API cookie 失效（HTTP ${resp.status}，@${screenName}），请重新导出浏览器 cookie 到 data/x_cookie.txt`);
+    err.code = 'X_API_UNREACHABLE';
+    throw err;
+  }
+  if (resp.status === 404) {
+    const err = new Error(`X UserTweets 端点 404（@${screenName}）——queryId 可能已轮换，请更新环境变量 VRC_MONITOR_X_USERTWEETS_QUERY_ID`);
+    err.code = 'X_API_UNREACHABLE';
+    throw err;
+  }
+  if (resp.status !== 200) {
+    const err = new Error(`X UserTweets 请求失败（@${screenName}）：HTTP ${resp.status}`);
+    err.code = 'X_API_UNREACHABLE';
+    throw err;
+  }
+
+  let obj;
+  try { obj = JSON.parse(resp.body); } catch {
+    const err = new Error(`X UserTweets 响应 JSON 解析失败（@${screenName}）`);
+    err.code = 'X_API_UNREACHABLE';
+    throw err;
+  }
+
+  const tweets = parseUserTweetsTimeline(obj, screenName);
+  if (tweets.length === 0) {
+    const err = new Error(`X UserTweets 未返回推文（@${screenName}）——timeline 为空或结构变更`);
+    err.code = 'X_API_UNREACHABLE';
+    throw err;
+  }
+  return tweets;
 }
 
 // ── Playwright 浏览器抓取（有头，绕过 Anubis/Cloudflare）──
@@ -954,11 +1185,51 @@ function mapWorld(w) {
  *  - 三通道均失败/均空时抛 X_FETCH_ALL_FAILED（含诊断、可读错误提示）。
  */
 export async function fetchCreatorTweets(screenName, { minTweets = 0 } = {}) {
+  const minTweetsEffective = parseInt(process.env.VRC_MONITOR_X_MIN_TWEETS, 10) || minTweets || 0;
+  /** 按推文 id 合并去重（后续通道补充时使用，保留先到者） */
+  const mergeTweets = (base, extra) => {
+    const seen = new Set(base.map(t => t.id).filter(Boolean));
+    for (const t of extra || []) {
+      if (t.id && !seen.has(t.id)) { base.push(t); seen.add(t.id); }
+    }
+    return base;
+  };
+
+  let tweets = [];
+  let source = '';
+
+  // ── 通道 1：X API UserTweets（cookie 鉴权）──
+  try {
+    tweets = await fetchCreatorViaXApi(screenName);
+    source = 'x_api';
+    if (minTweetsEffective > 0 && tweets.length < minTweetsEffective) {
+      log(`[警告] x-world @${screenName} X API 仅 ${tweets.length} 条(< minTweets=${minTweetsEffective})，继续尝试后续通道补充`);
+      logExtFallback('X', `@${screenName} X API 抓取`, `条数不足(${tweets.length}<${minTweetsEffective})，继续后续通道补充`);
+    } else {
+      log(`x-world @${screenName} X API 通道成功：${tweets.length} 条推文`);
+      return { tweets: await enrichWorldsWithTco(tweets, screenName), source };
+    }
+  } catch (e) {
+    if (e.code === 'X_API_UNREACHABLE' && /cookie 未配置/i.test(e.message)) {
+      log(`x-world @${screenName} X API 通道未配置 cookie，跳过`);
+    } else {
+      log(`[警告] x-world @${screenName} X API 通道失败，回退后续通道：${e.message}`);
+      logExtFallback('X', `@${screenName} X API 抓取`, `失败回退后续通道：${e.message}`);
+    }
+  }
+
+  // ── 通道 2：Playwright 浏览器 ──
   const xCfg = getXPlaywrightConfig();
   if (xCfg.enabled) {
     try {
-      const tweets = await fetchCreatorViaBrowser(screenName);
-      return { tweets: await enrichWorldsWithTco(tweets, screenName), source: 'browser' };
+      const browserTweets = await fetchCreatorViaBrowser(screenName);
+      if (tweets.length === 0) {
+        return { tweets: await enrichWorldsWithTco(browserTweets, screenName), source: 'browser' };
+      }
+      mergeTweets(tweets, browserTweets);
+      source = 'x_api+browser';
+      log(`x-world @${screenName} 浏览器通道补充后共 ${tweets.length} 条推文（source=${source}）`);
+      return { tweets: await enrichWorldsWithTco(tweets, screenName), source };
     } catch (e) {
       log(`[警告] x-world @${screenName} 浏览器抓取失败，回退 HTTP 通道：${e.message}`);
       // 降级留痕：浏览器通道不可用 → 回退 Nitter/SearchTimeline（一次触发恰好一行）
@@ -966,41 +1237,55 @@ export async function fetchCreatorTweets(screenName, { minTweets = 0 } = {}) {
       // 落到下方原 Nitter RSS → SearchTimeline 链
     }
   }
-  const minTweetsEffective = parseInt(process.env.VRC_MONITOR_X_MIN_TWEETS, 10) || minTweets || 0;
-  let tweets = [];
-  let source = '';
+
+  // ── 通道 3/4：Nitter RSS → X SearchTimeline（X API 已有数据时做合并补充）──
   try {
-    tweets = await fetchCreatorRss(screenName);
-    source = 'nitter';
+    const rssTweets = await fetchCreatorRss(screenName);
+    if (tweets.length === 0) {
+      tweets = rssTweets;
+      source = 'nitter';
+    } else {
+      mergeTweets(tweets, rssTweets);
+      source = 'x_api+nitter';
+      log(`x-world @${screenName} Nitter 补充后共 ${tweets.length} 条推文（source=${source}）`);
+    }
     if (minTweetsEffective > 0 && tweets.length < minTweetsEffective) {
-      log(`[警告] x-world @${screenName} Nitter 仅 ${tweets.length} 条(< minTweets=${minTweetsEffective})，尝试 SearchTimeline 补充`);
+      log(`[警告] x-world @${screenName} 合并后仅 ${tweets.length} 条(< minTweets=${minTweetsEffective})，尝试 SearchTimeline 补充`);
       try {
         const extra = await fetchCreatorViaSearchTimeline(screenName);
-        const seen = new Set(tweets.map(t => t.id));
-        for (const t of extra) {
-          if (t.id && !seen.has(t.id)) { tweets.push(t); seen.add(t.id); }
-        }
-        source = 'nitter+search_timeline';
+        mergeTweets(tweets, extra);
+        source = source.includes('nitter') ? 'nitter+search_timeline' : `${source}+search_timeline`;
       } catch (e2) {
-        log(`  （SearchTimeline 补充失败，保留 Nitter 数据：${e2.message.slice(0, 60)}）`);
+        log(`  （SearchTimeline 补充失败，保留已有数据：${e2.message.slice(0, 60)}）`);
       }
     }
   } catch (e) {
     log(`[警告] x-world @${screenName} Nitter 不可达，回退 X SearchTimeline：${e.message}`);
     try {
-      tweets = await fetchCreatorViaSearchTimeline(screenName);
-      source = 'search_timeline';
+      const extra = await fetchCreatorViaSearchTimeline(screenName);
+      if (tweets.length === 0) {
+        tweets = extra;
+        source = 'search_timeline';
+      } else {
+        mergeTweets(tweets, extra);
+        source = `${source}+search_timeline`;
+      }
     } catch (e2) {
-      const err = new Error(`@${screenName} Nitter / X SearchTimeline / 浏览器抓取均不可用（2026 上游反向爬 + 网络受限），该通道当前无法获取新推荐。`);
-      err.code = 'X_FETCH_ALL_FAILED';
-      logExtFailure('X', `@${screenName} 三通道抓取`, err);
-      throw err;
+      if (tweets.length === 0) {
+        const err = new Error(`@${screenName} X API / 浏览器 / Nitter / X SearchTimeline 均不可用（2026 上游反向爬 + 网络受限），该通道当前无法获取新推荐。`);
+        err.code = 'X_FETCH_ALL_FAILED';
+        logExtFailure('X', `@${screenName} 四通道抓取`, err);
+        throw err;
+      }
+      // 部分降级：后续通道全失败，但 X API 已有数据 → 保留并留痕（不静默）
+      log(`[警告] x-world @${screenName} 后续通道全部失败，保留 X API 已有 ${tweets.length} 条推文`);
+      logExtFallback('X', `@${screenName} 后续通道`, `全部失败，保留已获取数据：${e2.message.slice(0, 80)}`);
     }
   }
   if (tweets.length === 0) {
-    const err = new Error(`@${screenName} Nitter / X SearchTimeline / 浏览器抓取均未返回推文（2026 上游反向爬 + 网络受限），该通道当前无法获取新推荐。`);
+    const err = new Error(`@${screenName} X API / 浏览器 / Nitter / X SearchTimeline 均未返回推文（2026 上游反向爬 + 网络受限），该通道当前无法获取新推荐。`);
     err.code = 'X_FETCH_ALL_FAILED';
-    logExtFailure('X', `@${screenName} 三通道抓取`, '三通道均返回空（无推文）');
+    logExtFailure('X', `@${screenName} 四通道抓取`, '四通道均返回空（无推文）');
     throw err;
   }
   return { tweets: await enrichWorldsWithTco(tweets, screenName), source };
@@ -1097,7 +1382,7 @@ export async function scanCreatorWorlds({ force = false } = {}) {
       logExtFailure('X', `@${screen} 推荐抓取`, e, { durationMs: 0 });
       // 结构化错误：三通道均失败 → 用户可读的降级提示
       const errorInfo = e.code === 'X_FETCH_ALL_FAILED'
-        ? `Nitter / X SearchTimeline / 浏览器抓取均不可用（2026 上游反向爬 + 网络受限），该通道当前无法获取新推荐。`
+        ? `X API / 浏览器 / Nitter / X SearchTimeline 均不可用（2026 上游反向爬 + 网络受限），该通道当前无法获取新推荐。`
         : e.message;
       results.push({ screen_name: screen, name: creator.name || screen, tweets: 0, worlds: 0, error: errorInfo });
     }
