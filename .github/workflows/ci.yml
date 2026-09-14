@@ -1,11 +1,20 @@
 name: CI
 
 # 无真实 VRChat 凭据的冒烟测试（解冻 PR-3）：
+#   - npm test                   （node --test "test/**/*.test.mjs" 全量单测；issue #190 起纳入门禁）
 #   - test/test-registry.mjs  （注册表完整性：工具数、顺序+定义+handler，无凭据可跑）
 #   - scripts/dump-tools.mjs     （权威工具清单，行数须与 core/tool-order.json 一致——动态推导，不写死）
 #   - test/test-storage-snapshot.mjs（storage 行为等价基线：公共方法「输入→返回」快照，--check 对比 golden）
 #   - test/test-migrate-data.mjs（issue #103 回归：无 data/ 目录启动不崩 + 迁移引导行为/warn 提示）
+#   - test/test-auth-guard.mjs   （#159 鉴权 fail-closed 安全网：启动期拒启 + 运行期 401；issue #190 起纳入门禁）
+#   - test/test-safe-mode.mjs    （安全模式门控：破坏性工具过滤/放行；issue #190 起纳入门禁）
+#   - test/test-totp.mjs         （TOTP 纯算法验证，无网络无凭据；issue #190 起纳入门禁）
 #   - scripts/check-doc-drift.py （文档漂移：skill 工具清单/数字残留/版本同步/死引用，has_drift=false）
+#
+# ⚠️ 命名与收录（issue #190）：`npm test` 的 glob 只收 `*.test.mjs`（带 .test 段）；
+#    `test-*.mjs` 是独立套件、不会被 npm test 收录——要进门禁必须像下面这样显式加一步。
+#    反之，`test-apis.mjs` / `test-websocket.mjs` / `test-ws-direct.mjs` / `test-fetch-x-worlds*.mjs`
+#    依赖真实凭据或外网，**不得**加入 CI。
 #
 # 刻意不接入任何真实凭据：本仓库所有自动化测试只能覆盖「无凭据也能验证」的部分，
 # 涉及真实 VRChat 登录的验证仍由作者人工完成（见 DEVELOPMENT.md「测试与 CI」）。
@@ -46,6 +55,18 @@ jobs:
 
       - name: Install plugin dependencies (per-plugin package.json)
         run: npm run install-plugins
+
+      - name: Unit tests (npm test — test/**/*.test.mjs glob)
+        run: npm test
+
+      - name: Auth guard fail-closed regression (issue #159, no credentials)
+        run: node test/test-auth-guard.mjs
+
+      - name: Safe mode gating (no credentials)
+        run: node test/test-safe-mode.mjs
+
+      - name: TOTP algorithm (pure, no credentials)
+        run: node test/test-totp.mjs
 
       - name: Registry integrity (tools, no credentials)
         run: node test/test-registry.mjs
