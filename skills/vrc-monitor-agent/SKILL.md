@@ -37,6 +37,8 @@ metadata:
 | `backup_database` | 立即备份数据库（WAL 在线备份，保留最近 2 份到 data/backups/）；服务启动 + 每 24h 自动备份 |
 | `get_dynamic_status` | **动态状态引擎配置查询**（按在线好友数量自动更新自己的自定义状态 statusDescription）：enabled（开关,默认关闭）、template（文本模板,{online} 占位符替换为当前在线好友数）、onlineNow、lastSent/lastAt（最近一次实际提交） |
 | `set_dynamic_status` | **设置动态状态**：enabled 开关（默认关闭）、template 模板（{online} 占位符,最长 64 字符）、syncNow 保存后立即强制同步（默认 true）。引擎内置 65s 冷却 + 文本不变不提交（PUT /users/{userId} 只改 statusDescription,status 种类不变）；事件驱动（friend-online/offline）+ 5 分钟定时核对兜底 |
+| `get_presence_status` | **按在场自动状态配置查询**（presence-status 插件：按自己是否在游戏内自动切换自定义状态文字）：config（enabled / inGameTemplate / idleTemplate / pollSeconds）、presence（核心自我在场三态 in_game 在游戏内 / not_in_game 只在网页端在线 / unknown 无法判定，含 location/at/ageMs）、lastText/lastAppliedAt/lastState/lastError、serviceAvailable、minApplyIntervalMs |
+| `set_presence_status` | **设置按在场自动状态**（presence-status 插件）：enabled 开关（默认关闭）、inGameTemplate 在游戏内文案、idleTemplate 挂机文案（各 ≤64 字符，只改 statusDescription、status 种类原样保留）、pollSeconds 轮询间隔秒（默认 60，下限 20，上限 3600）、syncNow 保存后立即同步（默认 true）。判定源 = 核心服务 `dashboard.selfPresence`（user-location 事件三态）；unknown **不翻转现状**；两次 PUT 最小间隔 65s、文案不变不提交、写前核对当前文案 |
 | `get_friend_events` | 某好友的事件历史（本地库） |
 | `get_recent_events` | 事件流查询：无 typeFilter 时返回最新事件窗口；带 typeFilter 为 **SQL 层按类型检索**（返回该类型最近事件，可查任意历史类型，如 `typeFilter="friend-delete"`） |
 | `get_friend_removals` | **[friend-removals 插件] 谁把我删了**：列出历史上解除好友的人（friend-delete 事件）。userId 省略=全部；days=最近 N 天；返回 userId/displayName（回填最后使用名）/nickname/createdAt |
