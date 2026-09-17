@@ -1,15 +1,16 @@
 /**
- * presence-status.test.mjs — presence-status 插件回归（按自我在场切换自定义状态描述）
+ * presence-status.test.mjs — presence-status 插件回归（按自我在场「捕获 + 恢复」自定义状态文字）
  *
- * 覆盖：纯函数（模板选择 / 轮询间隔钳制 / 模板校验 / 冷却判定）+ register() 行为
- *      （工具注册、默认关闭不动作、三态分支、文案未变不提交、写前核对、参数校验）。
+ * 覆盖：纯函数（动作判定 / 轮询间隔钳制 / 文案校验 / 冷却）+ register() 行为
+ *      （工具注册、默认关闭不动作、转换点动作、捕获逻辑、恢复逻辑、unknown 不翻转、
+ *        写前核对、参数校验、跨重启持久化）。
  * 自包含：手写最小 fake api（db / vrchat.fetch / consume 全为可断言的替身），
  * 不触网、不写生产库。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import register, {
-  pickTemplate,
+  decideAction,
   clampPollSeconds,
   isValidTemplate,
   isWithinCooldown,
@@ -17,8 +18,8 @@ import register, {
 
 const SELF = 'usr_me_test';
 
-function makeDb() {
-  const rows = new Map();
+function makeDb(initial = {}) {
+  const rows = new Map(Object.entries(initial));
   const handle = {
     all: () => [...rows.entries()].map(([cfg_key, cfg_val]) => ({ cfg_key, cfg_val })),
     // 真仓库用命名参数（$k/$v）；fake 只断言"键与值被写入"
@@ -27,12 +28,12 @@ function makeDb() {
   return { table: () => handle, __rows: rows };
 }
 
-function makeApi({ presence = { state: 'not_in_game', location: 'offline:offline' }, user = { id: SELF, status: 'join me', statusDescription: '' }, serviceAvailable = true } = {}) {
+function makeApi({ presence = { state: 'not_in_game', location: 'offline:offline' }, user = { id: SELF, status: 'join me', statusDescription: '' }, serviceAvailable = true, initial = {} } = {}) {
   const tools = new Map();
   const fetchCalls = [];
   const logs = [];
   const api = {
-    db: makeDb(),
+    db: makeDb(initial),
     registerTool: (def) => tools.set(def.name, def),
     log: (m) => logs.push(String(m)),
     hasService: () => serviceAvailable,
@@ -48,25 +49,43 @@ function makeApi({ presence = { state: 'not_in_game', location: 'offline:offline
   return { api, tools, fetchCalls, logs };
 }
 
-// ── 纯函数 ────────────────────────────────────────────────────────────────
-test('pickTemplate：按三态选模板，unknown 不改现状（空串）', () => {
-  const cfg = { inGameTemplate: 'A', idleTemplate: 'B' };
-  assert.equal(pickTemplate(cfg, 'in_game'), 'A');
-  assert.equal(pickTemplate(cfg, 'not_in_game'), 'B');
-  assert.equal(pickTemplate(cfg, 'unknown'), '');
+const puts = (fetchCalls) => fetchCalls.filter(c => c.opts && c.opts.method === 'PUT');
+
+// ── 纯函数：动作判定 ───────────────────────────────────────────────────────
+test('decideAction：unknown 不翻转', () => {
+  assert.deepEqual(decideAction('unknown', 'in_game', { idleTemplate: 'B', savedText: 'X' }), { action: 'skip', reason: 'state-unknown' });
+  assert.deepEqual(decideAction('unknown', '', { idleTemplate: 'B', savedText: '' }), { action: 'skip', reason: 'state-unknown' });
 });
 
+test('decideAction：无转换不动作（进/出游戏各只在转换点触发一次）', () => {
+  assert.deepEqual(decideAction('in_game', 'in_game', { idleTemplate: 'B', savedText: 'X' }), { action: 'skip', reason: 'no-transition' });
+  assert.deepEqual(decideAction('not_in_game', 'not_in_game', { idleTemplate: 'B', savedText: 'X' }), { action: 'skip', reason: 'no-transition' });
+});
+
+test('decideAction：离开游戏 → 写入挂机文案', () => {
+  assert.deepEqual(decideAction('not_in_game', 'in_game', { idleTemplate: 'Bot挂机', savedText: '' }), { action: 'idle', text: 'Bot挂机' });
+  assert.deepEqual(decideAction('not_in_game', '', { idleTemplate: 'Bot挂机', savedText: '' }), { action: 'idle', text: 'Bot挂机' });
+});
+
+test('decideAction：回到游戏 → 恢复捕获文字；无捕获值/捕获值是挂机文案时清空', () => {
+  assert.deepEqual(decideAction('in_game', 'not_in_game', { idleTemplate: 'Bot挂机', savedText: '看番中' }), { action: 'restore', text: '看番中' });
+  // 没有捕获值 → 清空（绝不把挂机文案留在游戏内状态上）
+  assert.deepEqual(decideAction('in_game', 'not_in_game', { idleTemplate: 'Bot挂机', savedText: '' }), { action: 'restore', text: '' });
+  assert.deepEqual(decideAction('in_game', '', { idleTemplate: 'Bot挂机', savedText: 'Bot挂机' }), { action: 'restore', text: '' });
+});
+
+// ── 纯函数：其它 ─────────────────────────────────────────────────────────
 test('clampPollSeconds：默认兜底 + 上下限钳制', () => {
   assert.equal(clampPollSeconds(undefined), 60);
   assert.equal(clampPollSeconds('abc'), 60);
   assert.equal(clampPollSeconds(0), 60);
-  assert.equal(clampPollSeconds(5), 20);      // 下限
-  assert.equal(clampPollSeconds(99999), 3600); // 上限
+  assert.equal(clampPollSeconds(5), 20);
+  assert.equal(clampPollSeconds(99999), 3600);
   assert.equal(clampPollSeconds(120), 120);
 });
 
 test('isValidTemplate：非空字符串且 ≤64 字符', () => {
-  assert.equal(isValidTemplate('挂机中'), true);
+  assert.equal(isValidTemplate('Bot挂机'), true);
   assert.equal(isValidTemplate(''), false);
   assert.equal(isValidTemplate('   '), false);
   assert.equal(isValidTemplate(123), false);
@@ -91,7 +110,7 @@ test('register：注册两个工具并返回 dispose', () => {
   dispose();
 });
 
-test('默认关闭：set_presence_status 不触发任何 VRChat 调用', async () => {
+test('默认关闭：不触发任何 VRChat 调用', async () => {
   const { api, tools, fetchCalls } = makeApi();
   const dispose = register(api);
   const res = await tools.get('set_presence_status').handler({});
@@ -101,24 +120,79 @@ test('默认关闭：set_presence_status 不触发任何 VRChat 调用', async (
   dispose();
 });
 
-test('开启且在游戏内 → PUT 用 inGameTemplate，且保留 status 种类不改在线形态', async () => {
-  const { api, tools, fetchCalls } = makeApi({ presence: { state: 'in_game', location: 'wrld_abc:1', worldId: 'wrld_abc' } });
+test('首次运行且不在游戏内 → 写入挂机文案（并捕获当前文案作为 savedText）', async () => {
+  const { api, tools, fetchCalls } = makeApi({ user: { id: SELF, status: 'ask me', statusDescription: '看番中' } });
   const dispose = register(api);
-  await tools.get('set_presence_status').handler({ enabled: true, inGameTemplate: '在玩', idleTemplate: '挂机' });
-  const put = fetchCalls.find(c => c.opts && c.opts.method === 'PUT');
-  assert.ok(put, '应发生一次 PUT');
-  assert.equal(put.path, `/users/${SELF}`);
-  assert.deepEqual(put.opts.body, { statusDescription: '在玩', status: 'join me' });
+  const res = await tools.get('set_presence_status').handler({ enabled: true, idleTemplate: 'Bot挂机' });
+  assert.equal(res.syncResult.action, 'applied');
+  assert.equal(puts(fetchCalls)[0].opts.body.statusDescription, 'Bot挂机');
+  // 捕获：当前文案（看番中）被存为 savedText
+  assert.equal(res.savedText, '看番中');
+  // 只改 statusDescription，status 种类原样保留
+  assert.equal(puts(fetchCalls)[0].opts.body.status, 'ask me');
   dispose();
 });
 
-test('只在网页端在线 → PUT 用 idleTemplate', async () => {
-  const { api, tools, fetchCalls } = makeApi({ presence: { state: 'not_in_game', location: 'offline:offline' } });
+test('捕获保护：当前文案已是挂机文案时不写入 savedText（避免把挂机文案当成"上次状态"）', async () => {
+  const { api, tools } = makeApi({ user: { id: SELF, status: 'active', statusDescription: '' } });
   const dispose = register(api);
-  await tools.get('set_presence_status').handler({ enabled: true, inGameTemplate: '在玩', idleTemplate: '挂机中' });
-  const put = fetchCalls.find(c => c.opts && c.opts.method === 'PUT');
-  assert.equal(put.opts.body.statusDescription, '挂机中');
+  const res = await tools.get('set_presence_status').handler({ enabled: true, idleTemplate: 'Bot挂机' });
+  assert.equal(res.savedText, '');
   dispose();
+});
+
+test('捕获保护：当前文案等于我们自己上次写入的文案时不捕获（跨重启也生效）', async () => {
+  // lastText 是"我们上次写的"，当前文案仍是它 → 不能当成使用者的状态
+  const { api, tools } = makeApi({
+    user: { id: SELF, status: 'active', statusDescription: '挂机中（服务在线）' },
+    initial: { enabled: 'true', idleTemplate: 'Bot挂机', lastText: '挂机中（服务在线）', lastState: 'in_game' },
+  });
+  const dispose = register(api);
+  const res = await tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(res.syncResult.action, 'applied');
+  assert.equal(res.savedText, '');
+  dispose();
+});
+
+test('回到游戏内 → 恢复 savedText（不是固定文案）', async () => {
+  const { api, tools, fetchCalls } = makeApi({
+    presence: { state: 'in_game', location: 'wrld_abc:1' },
+    user: { id: SELF, status: 'join me', statusDescription: 'Bot挂机' },
+    initial: { enabled: 'true', savedText: '看番中', lastState: 'not_in_game' },
+  });
+  const dispose = register(api);
+  const res = await tools.get('get_presence_status').handler(); // 只读一次，确认配置已载入
+  assert.equal(res.savedText, '看番中');
+  const sync = await tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(sync.syncResult.action, 'restored');
+  assert.equal(puts(fetchCalls)[0].opts.body.statusDescription, '看番中');
+  dispose();
+});
+
+test('回到游戏内但没有捕获值：当前是挂机文案 → 清空；已为空 → 不重复提交', async () => {
+  const { api, tools, fetchCalls } = makeApi({
+    presence: { state: 'in_game', location: 'wrld_abc:1' },
+    user: { id: SELF, status: 'ask me', statusDescription: 'Bot挂机' },
+    initial: { enabled: 'true', savedText: '', idleTemplate: 'Bot挂机', lastState: 'not_in_game' },
+  });
+  const dispose = register(api);
+  const res = await tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(res.syncResult.action, 'restored');
+  assert.equal(puts(fetchCalls)[0].opts.body.statusDescription, '');
+  assert.equal(puts(fetchCalls)[0].opts.body.status, 'ask me');
+  dispose();
+
+  // 已为空 → 目标文案与现状一致，不重复 PUT
+  const second = makeApi({
+    presence: { state: 'in_game', location: 'wrld_abc:1' },
+    user: { id: SELF, status: 'ask me', statusDescription: '' },
+    initial: { enabled: 'true', savedText: '', lastState: 'not_in_game' },
+  });
+  const d2 = register(second.api);
+  const r2 = await second.tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(r2.syncResult.reason, 'already-set');
+  assert.equal(puts(second.fetchCalls).length, 0);
+  d2();
 });
 
 test('unknown（无法判定）→ 不动现状，不发 PUT', async () => {
@@ -126,27 +200,16 @@ test('unknown（无法判定）→ 不动现状，不发 PUT', async () => {
   const dispose = register(api);
   const res = await tools.get('set_presence_status').handler({ enabled: true });
   assert.equal(res.syncResult.reason, 'state-unknown');
-  assert.equal(fetchCalls.filter(c => c.opts && c.opts.method === 'PUT').length, 0);
+  assert.equal(puts(fetchCalls).length, 0);
   dispose();
 });
 
-test('文案未变化 → 第二次同步跳过且不再 PUT', async () => {
-  const { api, tools, fetchCalls } = makeApi();
+test('写前核对：目标文案已在位 → 只记基线，不重复 PUT', async () => {
+  const { api, tools, fetchCalls } = makeApi({ user: { id: SELF, status: 'active', statusDescription: 'Bot挂机' } });
   const dispose = register(api);
-  await tools.get('set_presence_status').handler({ enabled: true, idleTemplate: '挂机中' });
-  const before = fetchCalls.filter(c => c.opts && c.opts.method === 'PUT').length;
-  const res = await tools.get('set_presence_status').handler({ idleTemplate: '挂机中' });
-  assert.equal(res.syncResult.reason, 'unchanged');
-  assert.equal(fetchCalls.filter(c => c.opts && c.opts.method === 'PUT').length, before);
-  dispose();
-});
-
-test('写前核对：当前文案已等于目标值 → 只记基线，不重复 PUT', async () => {
-  const { api, tools, fetchCalls } = makeApi({ user: { id: SELF, status: 'active', statusDescription: '挂机中' } });
-  const dispose = register(api);
-  const res = await tools.get('set_presence_status').handler({ enabled: true, idleTemplate: '挂机中' });
+  const res = await tools.get('set_presence_status').handler({ enabled: true, idleTemplate: 'Bot挂机' });
   assert.equal(res.syncResult.reason, 'already-set');
-  assert.equal(fetchCalls.filter(c => c.opts && c.opts.method === 'PUT').length, 0);
+  assert.equal(puts(fetchCalls).length, 0);
   dispose();
 });
 
@@ -164,39 +227,41 @@ test('参数校验：类型/长度/数字非法时拒绝且不写入', async () 
   const dispose = register(api);
   const set = tools.get('set_presence_status');
   assert.equal((await set.handler({ enabled: 'yes' })).ok, false);
-  assert.equal((await set.handler({ inGameTemplate: '' })).ok, false);
+  assert.equal((await set.handler({ idleTemplate: '' })).ok, false);
   assert.equal((await set.handler({ idleTemplate: 'x'.repeat(65) })).ok, false);
   assert.equal((await set.handler({ pollSeconds: 'abc' })).ok, false);
+  assert.equal((await set.handler({ savedText: 123 })).ok, false);
+  assert.equal((await set.handler({ savedText: 'x'.repeat(65) })).ok, false);
   const cfg = (await tools.get('get_presence_status').handler()).config;
   assert.equal(cfg.enabled, false);
   assert.equal(cfg.pollSeconds, 60);
   dispose();
 });
 
-test('get_presence_status：返回配置、在场判定与最近应用信息', async () => {
-  const { api, tools } = makeApi({ presence: { state: 'in_game', location: 'wrld_abc:1', worldId: 'wrld_abc' } });
+test('get_presence_status：返回配置、在场判定、已捕获文字与最近应用信息', async () => {
+  const { api, tools } = makeApi({ presence: { state: 'not_in_game', location: 'offline:offline' } });
   const dispose = register(api);
-  await tools.get('set_presence_status').handler({ enabled: true, inGameTemplate: '在玩' });
   const res = await tools.get('get_presence_status').handler();
   assert.equal(res.serviceAvailable, true);
-  assert.equal(res.config.enabled, true);
-  assert.equal(res.presence.state, 'in_game');
-  assert.equal(res.lastText, '在玩');
-  assert.equal(res.lastAppliedAt.length > 0, true);
+  assert.equal(res.config.idleTemplate.length > 0, true);
+  assert.equal(res.presence.state, 'not_in_game');
+  assert.equal(typeof res.savedText, 'string');
+  assert.equal(typeof res.minApplyIntervalMs, 'number');
   dispose();
 });
 
-test('配置跨重启保留（重载后 enabled/lastText 从插件表恢复）', async () => {
-  const { api, tools } = makeApi();
+test('跨重启持久化：enabled / lastState / savedText / lastText 从插件表恢复', async () => {
+  const { api, tools } = makeApi({ user: { id: SELF, status: 'active', statusDescription: '看番中' } });
   const d1 = register(api);
-  await tools.get('set_presence_status').handler({ enabled: true, idleTemplate: '挂机中' });
+  await tools.get('set_presence_status').handler({ enabled: true, idleTemplate: 'Bot挂机' });
   d1();
-  // 用同一个 api（同一份 db）重新 register，模拟热重载
   const tools2 = new Map();
   const api2 = { ...api, registerTool: (def) => tools2.set(def.name, def) };
   const d2 = register(api2);
   const res = await tools2.get('get_presence_status').handler();
   assert.equal(res.config.enabled, true);
-  assert.equal(res.lastText, '挂机中');
+  assert.equal(res.savedText, '看番中');
+  assert.equal(res.lastState, 'not_in_game');
+  assert.equal(res.lastText, 'Bot挂机');
   d2();
 });

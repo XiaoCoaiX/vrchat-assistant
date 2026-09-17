@@ -1,41 +1,57 @@
-# presence-status —— 按「自己是否在游戏内」自动切换自定义状态描述
+# presence-status —— 按「自己是否在游戏内」自动切换自定义状态文字
 
 > 本文档给调用本插件的 AI Agent 看：这个插件能做什么、怎么用。
 
 ## 为什么需要它
 
 本服务常驻登录 VRChat 账号（云服务器 24h 在线）时，自己在好友眼里长期是
-**"在网站上活跃"**（位置 `offline:offline`）。使用者希望一眼能区分两种情况：
+**"在网站上活跃"**（位置 `offline:offline`）。使用者要求：
 
-- **在游戏内**（自己在 VRChat 客户端里）→ 一套状态文案
-- **只在网页端在线 / 挂机**（人不在游戏，服务还挂着）→ 另一套状态文案
+- **不在游戏内**（挂机，服务还开着）→ 状态文字显示"挂机"提示（如 `Bot挂机`）；
+- **回到游戏内** → **恢复成上次下线时的那条状态文字**（不是写死一套固定文案）。
 
-核心的动态状态引擎（`get_dynamic_status` / `set_dynamic_status`）只支持
-`{online}`（在线好友数）一个变量，无法区分上面两种情况；本插件补上这个能力。
+核心的动态状态引擎（`get_dynamic_status` / `set_dynamic_status`）只支持 `{online}`
+（在线好友数）一个变量，无法区分"自己是否在游戏里"；本插件补上这个能力。
 
 ## 能力
 
-- **get_presence_status**：查询配置、当前自我在场判定（`in_game` / `not_in_game` / `unknown`）、
-  最近一次成功写入的文案与时间、最近错误。
-- **set_presence_status**：设置开关、两套文案、轮询间隔；可 `syncNow` 立即同步一次。
+- **get_presence_status**：查询配置、核心自我在场判定（`in_game` / `not_in_game` / `unknown`）、
+  已捕获的"上次下线时状态" `savedText`、最近一次写入与错误。
+- **set_presence_status**：设置开关、挂机文案、轮询间隔、恢复用文字；可 `syncNow` 立即同步一次。
 
-配置项（存在插件私有表，跨重启保留）：
+配置项（存插件私有表 `plg_presence-status_settings`，跨重启保留）：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `false` | 是否启用自动切换（默认关闭，需显式开启） |
-| `inGameTemplate` | `在玩 VRChat，可能看不到消息` | 在游戏内时写入的自定义状态文字（≤64 字符） |
-| `idleTemplate` | `挂机中（服务在线）` | 只在网页端在线时写入的自定义状态文字（≤64 字符） |
+| `idleTemplate` | `挂机中（服务在线）` | **不在游戏内**时写入的状态文字（≤64 字符） |
 | `pollSeconds` | `60` | 轮询间隔秒（下限 20，上限 3600） |
+| `savedText` | （自动捕获） | **回到游戏内时要恢复的文字**。出游戏时自动捕获当前文案；也可手动指定（空串=清空，回到游戏后不改文字） |
+
+## 工作方式：捕获 + 恢复（转换点触发）
+
+```
+在游戏内 ──检测到出游戏──▶ ① 读当前状态文字并捕获为 savedText（= 你上次下线的状态）
+                          ② 写入 idleTemplate（如 Bot挂机）
+不在游戏 ──检测到进游戏──▶ 写回 savedText
+```
+
+- **只在转换点动作**：进/出游戏各触发一次，之后不反复改写——你在别处手动改的状态文字会被保留
+  （不会被每次轮询抢回去）。
+- **判定源**：核心服务 `dashboard.selfPresence` 的三态（见 `core/self-presence.js`）。
+- **不确定就不动**：`unknown`（无位置记录 / 位置陈旧超 1 小时 / 解析失败）时不翻转现状。
+- **没有可恢复值时不动**：`savedText` 为空、或恰好等于 `idleTemplate` 时，回到游戏内不改文字。
+- **只改状态文字**（`statusDescription`），`status` 种类原样回传，**不改变在线形态**。
+- **防抖**：两次 PUT 之间最小间隔 65 秒（与核心动态状态引擎同阈值）；目标文案已在位时不重复提交；
+  重启后从插件表恢复 `lastState`/`savedText`，不会因重启重复动作。
+- **延迟**：插件契约 v1.3 的 8 个 API 面没有事件订阅能力，因此按 `pollSeconds` 轮询（默认 60s）
+  ——从你进/出游戏到文字切换，最坏延迟约等于轮询间隔。轮询只查本地 SQL（不产生 VRChat API 调用），
+  每个转换点最多 2 次 API 调用（`/auth/user` + `PUT /users/{id}`）。
 
 ## 用法
 
-Agent 直接通过 MCP `tools/call` 调用，例如：
-
 ```
-set_presence_status { "enabled": true,
-                      "inGameTemplate": "在玩 VRChat，可能看不到消息",
-                      "idleTemplate": "挂机中（服务在线）" }
+set_presence_status { "enabled": true, "idleTemplate": "Bot挂机" }
 get_presence_status
 ```
 
@@ -43,25 +59,14 @@ get_presence_status
 
 ```json
 {
-  "config": { "enabled": true, "inGameTemplate": "…", "idleTemplate": "…", "pollSeconds": 60 },
+  "config": { "enabled": true, "idleTemplate": "Bot挂机", "pollSeconds": 60 },
   "presence": { "state": "not_in_game", "location": "offline:offline", "at": "2026-09-17T10:00:13.422Z" },
-  "lastText": "挂机中（服务在线）",
+  "savedText": "看番中",
+  "lastState": "not_in_game",
+  "lastText": "Bot挂机",
   "serviceAvailable": true
 }
 ```
-
-## 行为与不变量
-
-- **只改自定义状态文字**（`statusDescription`），`status` 种类原样回传，**不改变在线形态**。
-- **不确定就不动**：核心自我在场判定返回 `unknown`（无记录 / 位置陈旧超 1 小时 / 解析失败）时，
-  本插件**不翻转现状**，保持上一次写入的文案。
-- **防抖**：两次 PUT 之间最小间隔 65 秒（与核心动态状态引擎同阈值）；文案未变化不提交；
-  重启后从插件表恢复"最近写入文案"，不会因重启重复提交。
-- **写前核对**：PUT 之前先读 `/auth/user`，若当前文案已等于目标值则只记基线不重复提交
-  （使用者在别处手动改过同样文案时不会互相覆盖成抖动）。
-- **延迟**：插件契约 v1.3 的 8 个 API 面没有事件订阅能力，因此按 `pollSeconds` 轮询
-  （默认 60s）——**从你进/出游戏到文案切换，最坏延迟约等于轮询间隔**。轮询本身只查本地
-  SQL（不产生 VRChat API 调用），只有文案真正需要变化时才发生 `/auth/user` + `PUT /users/{id}`。
 
 ## 依赖
 
