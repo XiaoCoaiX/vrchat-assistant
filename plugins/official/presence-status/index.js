@@ -82,8 +82,9 @@ export function decideAction(state, lastState, { idleTemplate, savedText }) {
   if (state === 'unknown') return { action: 'skip', reason: 'state-unknown' };
   if (state === 'in_game') {
     if (lastState === 'in_game') return { action: 'skip', reason: 'no-transition' };
-    // 回到游戏：恢复上次下线时捕获的状态文字；没有捕获值（或捕获值就是挂机文案）时
-    // **清空**——绝不把挂机文案留在"人在游戏里"的状态上。
+    // 回到游戏：恢复上次下线时捕获的状态文字。没有捕获值（或捕获值就是挂机文案）时
+    // 本纯函数只给出 text = ''（清空意图）——**是否真的清空由 applyStatus 依现状裁定**：
+    // 现状确知是本插件写的才清空，是使用者自己写的文案则保持不动。
     const text = (savedText && savedText !== idleTemplate) ? savedText : '';
     return { action: 'restore', text };
   }
@@ -199,6 +200,19 @@ export default function register(api) {
         writeRaw('savedText', current);
       }
 
+      // 「回到游戏内但无可恢复值」的守卫：只有在**确知现状是本插件写的**（现状本身为空 /
+      // 正是挂机文案 / 正是我们上次写入的文案）时才清空；现状是使用者自己写的文案时
+      // **保持不动**，并把它采纳为新的基线（savedText）——否则首轮启用（人已在游戏内）
+      // 会悄悄抹掉使用者的文案，且此后永不恢复。见 SKILL.md「没有可恢复值时保护现状」。
+      if (decision.action === 'restore' && decision.text === ''
+        && current && current !== config.idleTemplate && current !== appliedText) {
+        writeRaw('savedText', current);
+        lastState = state;
+        writeRaw('lastState', state);
+        api.log(`presence-status: 无捕获值，保持使用者现有状态文字（${state}）→ 「${current}」`);
+        return { action: 'skipped', reason: 'keep-current-text', state, statusDescription: current };
+      }
+
       if (current === decision.text) {
         // 目标文案已在位（如使用者手动设过同样文案）→ 只记基线，不重复提交
         appliedText = decision.text;
@@ -262,7 +276,7 @@ export default function register(api) {
 
   api.registerTool({
     name: 'set_presence_status',
-    description: '[manage] 设置「按自己是否在游戏内自动切换自定义状态文字」：enabled 开关（默认关闭）、idleTemplate 不在游戏时写入的文案（≤64 字符，只改状态文字不改在线形态）、pollSeconds 轮询间隔秒（默认 60，下限 20）、savedText 回游戏时恢复用的文字（省略=保留已捕获值；传空串=清空，回到游戏后不改文字）、syncNow 保存后是否立即同步一次（默认 true）。进游戏恢复的是"上次下线时捕获的状态文字"。',
+    description: '[manage] 设置「按自己是否在游戏内自动切换自定义状态文字」：enabled 开关（默认关闭）、idleTemplate 不在游戏时写入的文案（≤64 字符，只改状态文字不改在线形态）、pollSeconds 轮询间隔秒（默认 60，下限 20）、savedText 回游戏时恢复用的文字（省略=保留已捕获值；传空串=清空，回到游戏后不改文字）、syncNow 保存后是否立即同步一次（默认 true）。进游戏恢复的是"上次下线时捕获的状态文字"；没有捕获值时不改使用者自己的现有文案。⚠️ 与本服务另一状态功能 set_dynamic_status（按在线好友数改状态文字）写同一个 statusDescription，同时启用会互相覆盖，建议只启用其一。',
     inputSchema: {
       type: 'object',
       properties: {

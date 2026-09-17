@@ -80,6 +80,12 @@ export function resolveSelfPresence(storage, { selfId = '', now = Date.now(), st
     return { ...base, state: 'not_in_game', location: loc, at, ageMs };
   }
 
+  // 位置字段不是字符串（如 content_json 为 {"location":123}）→ 无法判定，不向上抛异常
+  // （与重构前 dashboard.isSelfOnline 被外层 try/catch 兜成 null 的语义等价）
+  if (typeof loc !== 'string') {
+    return { ...base, state: 'unknown', at, ageMs };
+  }
+
   // 在游戏内的形态：真实世界 / 传送中 / 无 worldId 的实例可见性
   if (loc.startsWith('wrld_') || loc === 'traveling' || IN_GAME_LOCATION_RE.test(loc)) {
     if (ageMs === null || ageMs > staleMs) {

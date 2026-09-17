@@ -63,6 +63,22 @@ test('content_json 非法 JSON → unknown', () => {
   assert.equal(p.state, 'unknown');
 });
 
+test('location 非字符串（如 {"location":123}）→ unknown，不抛异常', () => {
+  for (const loc of [123, { a: 1 }, ['wrld_x:1'], true]) {
+    const rows = [{ content_json: JSON.stringify({ userId: SELF, location: loc }), created_at: '2026-09-17T11:59:00.000Z' }];
+    const p = resolveSelfPresence(makeStorage(rows), { selfId: SELF, now: NOW });
+    assert.equal(p.state, 'unknown', `location=${JSON.stringify(loc)}`);
+    assert.equal(p.location, '', `location=${JSON.stringify(loc)}`);
+    assert.equal(p.worldId, '');
+  }
+  // JSON null 走语言层 `|| ''` → 归为空位置（not_in_game），与重构前实现一致（非本次修复范围）
+  const nullRows = [{ content_json: JSON.stringify({ userId: SELF, location: null }), created_at: '2026-09-17T11:59:00.000Z' }];
+  assert.equal(resolveSelfPresence(makeStorage(nullRows), { selfId: SELF, now: NOW }).state, 'not_in_game');
+  // 与旧实现（dashboard.isSelfOnline 被外层 try/catch 兜成 null）三值映射一致
+  const rows = [{ content_json: JSON.stringify({ userId: SELF, location: 123 }), created_at: new Date().toISOString() }];
+  assert.equal(servicesWith(rows).get('dashboard.isSelfOnline')(), null);
+});
+
 test('offline / offline:offline / 空位置 → not_in_game（服务常驻登录即此态）', () => {
   for (const loc of ['offline', 'offline:offline', '']) {
     const p = resolveSelfPresence(makeStorage(rowFor(loc)), { selfId: SELF, now: NOW });

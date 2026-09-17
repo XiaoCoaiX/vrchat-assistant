@@ -204,6 +204,64 @@ test('unknown（无法判定）→ 不动现状，不发 PUT', async () => {
   dispose();
 });
 
+// ── 首轮启用误删使用者文案（REQUEST_CHANGES 阻断项回归）────────────────────
+test('回到游戏内但无捕获值、现状是使用者自己的文案 → 不清空，采纳为基线', async () => {
+  const { api, tools, fetchCalls } = makeApi({
+    presence: { state: 'in_game', location: 'wrld_abc:1~hidden(usr_me_test)~region(jp)' },
+    user: { id: SELF, status: 'join me', statusDescription: '我在游戏里的原有状态文字' },
+    initial: { enabled: 'true', idleTemplate: 'Bot挂机', savedText: '', lastState: 'not_in_game' },
+  });
+  const dispose = register(api);
+  const res = await tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(res.syncResult.action, 'skipped');
+  assert.equal(res.syncResult.reason, 'keep-current-text');
+  assert.equal(puts(fetchCalls).length, 0);                     // 绝不 PUT 空串
+  assert.equal(res.savedText, '我在游戏里的原有状态文字');         // 采纳为基线，供后续恢复
+  dispose();
+});
+
+test('基线采纳后闭环：出游戏写挂机文案 → 回游戏恢复使用者原文案', async () => {
+  // 第一段：首轮启用，人已在游戏内，现状是使用者文案 → 不清空，采纳为基线
+  const first = makeApi({
+    presence: { state: 'in_game', location: 'wrld_abc:1' },
+    user: { id: SELF, status: 'join me', statusDescription: '看番中' },
+    initial: { enabled: 'true', idleTemplate: 'Bot挂机', savedText: '', lastState: 'not_in_game' },
+  });
+  const d1 = register(first.api);
+  const r1 = await first.tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(r1.syncResult.reason, 'keep-current-text');
+  assert.equal(r1.savedText, '看番中');
+  assert.equal(puts(first.fetchCalls).length, 0);
+  const persisted1 = Object.fromEntries(first.api.db.__rows);
+  d1();
+
+  // 第二段：人离开游戏 → 写挂机文案，savedText 仍是使用者的文案
+  const second = makeApi({
+    presence: { state: 'not_in_game', location: 'offline:offline' },
+    user: { id: SELF, status: 'join me', statusDescription: '看番中' },
+    initial: persisted1,
+  });
+  const d2 = register(second.api);
+  const r2 = await second.tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(r2.syncResult.action, 'applied');
+  assert.equal(puts(second.fetchCalls)[0].opts.body.statusDescription, 'Bot挂机');
+  assert.equal(r2.savedText, '看番中');
+  const persisted2 = Object.fromEntries(second.api.db.__rows);
+  d2();
+
+  // 第三段：回到游戏 → 恢复使用者的原文案（不因为首轮「无捕获值」而丢失）
+  const third = makeApi({
+    presence: { state: 'in_game', location: 'wrld_abc:1' },
+    user: { id: SELF, status: 'join me', statusDescription: 'Bot挂机' },
+    initial: persisted2,
+  });
+  const d3 = register(third.api);
+  const r3 = await third.tools.get('set_presence_status').handler({ syncNow: true });
+  assert.equal(r3.syncResult.action, 'restored');
+  assert.equal(puts(third.fetchCalls)[0].opts.body.statusDescription, '看番中');
+  d3();
+});
+
 test('写前核对：目标文案已在位 → 只记基线，不重复 PUT', async () => {
   const { api, tools, fetchCalls } = makeApi({ user: { id: SELF, status: 'active', statusDescription: 'Bot挂机' } });
   const dispose = register(api);
