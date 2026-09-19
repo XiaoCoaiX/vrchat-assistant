@@ -79,6 +79,21 @@ export function extractInventoryList(res) {
   return [];
 }
 
+/** 从 inventory 列表响应提取 totalCount（缺失/非法返回 NaN，供 hasMore 判定） */
+export function extractTotalCount(res) {
+  const n = res && typeof res === 'object' ? Number(res.totalCount) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : NaN;
+}
+
+/**
+ * 从响应提取 errors 数组。
+ * 写操作不能只看 HTTP 状态：VRChat 可能返回 200 + 非空 errors[]（部分/全部失败），
+ * 此时 `ok` 必须为 false，否则调用方会把「没到账」误读为「已到账」。
+ */
+export function extractErrors(res) {
+  return res && Array.isArray(res.errors) ? res.errors : [];
+}
+
 /** 码/id 基础校验（纯函数，便于单测） */
 export function isPlausibleCode(value) {
   return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= MAX_CODE_CHARS;
@@ -146,14 +161,19 @@ export default function register(api) {
       try {
         const res = await api.vrchat.fetch('/reward/redeem', { method: 'POST', body: { code } });
         const items = extractRedeemedItems(res);
-        record({ kind: 'redeem', code, ok: true, name: items.map(i => i.name).filter(Boolean).join(', '), detail: { count: items.length, items: items.map(i => ({ id: i.inventoryId, name: i.name, itemType: i.itemType })) } });
+        const errors = extractErrors(res);
+        // 200 + 非空 errors = 部分/全部失败（如码无效），不能当成功
+        const ok = errors.length === 0;
+        record({ kind: 'redeem', code, ok, name: items.map(i => i.name).filter(Boolean).join(', '), detail: { count: items.length, errors, items: items.map(i => ({ id: i.inventoryId, name: i.name, itemType: i.itemType })) } });
         const hasBundle = items.some(i => i.itemType === 'bundle' || i.contains > 0);
-        api.log(`redeem: 兑换码提交成功（${items.length} 项${hasBundle ? '，含礼包待领取' : ''}）`);
+        api.log(`redeem: 兑换码${ok ? '提交成功' : '提交未成功'}（${items.length} 项${hasBundle ? '，含礼包待领取' : ''}${ok ? '' : `，errors=${errors.length}`}）`);
         return {
-          ok: true,
+          ok,
           code,
           count: items.length,
           items,
+          errors,
+          ...(ok ? {} : { error: 'VRChat 返回了 errors（码可能无效/已使用），请以 items/errors 为准' }),
           nextStep: hasBundle
             ? '本次含礼包（bundle）：请用 get_redeemable_bundles 查看，再 claim_bundle 领取礼包内容'
             : '物品已直接进入库存（可用 get_inventory_items 核对）',
@@ -174,13 +194,22 @@ export default function register(api) {
       '[query·兑换] 列出账号里**待领取的礼包（Bundles & Packs）**：兑换/活动/VRC+ 掉落都先以礼包形式存在，'
       + '必须再调 claim_bundle 领取才会得到实际物品。返回 inventoryId / 名称 / 获得时间 / 过期时间（expiryDate，'
       + 'null=不过期）/ seen（是否在客户端看过）。列表为空表示没有待领礼包。',
-    inputSchema: { type: 'object', properties: {} },
-    handler: async () => {
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: `返回条数（默认 ${MAX_ITEMS}，单次上限 ${MAX_ITEMS}）` },
+      },
+    },
+    handler: async (args = {}) => {
+      let limit = Number(args.limit);
+      if (!Number.isFinite(limit) || limit <= 0) limit = MAX_ITEMS;
+      limit = Math.min(MAX_ITEMS, Math.round(limit));
       try {
-        const res = await api.vrchat.fetch(`/inventory?types=bundle&n=${MAX_ITEMS}`);
+        const res = await api.vrchat.fetch(`/inventory?types=bundle&n=${limit}`);
         const data = extractInventoryList(res);
         const items = data.map(normalizeItem);
-        return { ok: true, count: items.length, items };
+        const total = extractTotalCount(res);
+        return { ok: true, count: items.length, total: Number.isFinite(total) ? total : null, items };
       } catch (err) {
         const e = describeError(err);
         api.log(`redeem: 待领礼包查询失败 status=${e.status} ${e.message}`);
@@ -194,12 +223,14 @@ export default function register(api) {
     name: 'claim_bundle',
     description:
       '[write·兑换] 领取（打开）一个礼包，内容物真正进入库存（POST /inventory/{inventoryId}/consume）。'
-      + 'inventoryId 来自 get_redeemable_bundles 或 redeem_code 的返回。'
-      + '返回本次到手的物品清单（name/itemType/description/acquisition）。礼包领取后即从待领列表消失，不可重复领取。',
+      + 'inventoryId 必须取自 get_redeemable_bundles 返回的 `inv_*`（库存实例 id）；'
+      + 'redeem_code 返回的是 `invt_*` 模板 id，**不可**直接用于本工具（实测 404 InventoryItem not found）。'
+      + '返回本次到手的物品清单（name/itemType/description/acquisition）。礼包领取后即从待领列表消失，不可重复领取。'
+      + 'ok 由响应 errors 是否为空判定（200 + 非空 errors = 部分失败，不当成功）。',
     inputSchema: {
       type: 'object',
       properties: {
-        inventoryId: { type: 'string', description: '礼包 id（形如 inv_xxx，取自 get_redeemable_bundles）' },
+        inventoryId: { type: 'string', description: '礼包库存实例 id（形如 inv_xxx，取自 get_redeemable_bundles；redeem_code 给的 invt_* 模板 id 不可用）' },
       },
       required: ['inventoryId'],
     },
@@ -212,10 +243,19 @@ export default function register(api) {
       try {
         const res = await api.vrchat.fetch(`/inventory/${encodeURIComponent(id)}/consume`, { method: 'POST', body: {} });
         const items = (res && Array.isArray(res.inventoryItems) ? res.inventoryItems : []).map(normalizeItem);
-        const errors = (res && Array.isArray(res.errors)) ? res.errors : [];
-        record({ kind: 'claim', inventoryId: id, ok: true, name: items.map(i => i.name).filter(Boolean).join(', '), detail: { count: items.length, errors } });
-        api.log(`redeem: 礼包领取成功（${items.length} 项）`);
-        return { ok: true, inventoryId: id, count: items.length, items, errors };
+        const errors = extractErrors(res);
+        // 200 + 非空 errors = 部分失败，不能当「已到账」
+        const ok = errors.length === 0;
+        record({ kind: 'claim', inventoryId: id, ok, name: items.map(i => i.name).filter(Boolean).join(', '), detail: { count: items.length, errors } });
+        api.log(`redeem: 礼包领取${ok ? '成功' : '未完全成功'}（${items.length} 项${ok ? '' : `，errors=${errors.length}`}）`);
+        return {
+          ok,
+          inventoryId: id,
+          count: items.length,
+          items,
+          errors,
+          ...(ok ? {} : { error: 'VRChat 返回了 errors（部分/全部失败），请以 items/errors 为准' }),
+        };
       } catch (err) {
         const e = describeError(err);
         record({ kind: 'claim', inventoryId: id, ok: false, detail: e });
@@ -229,28 +269,47 @@ export default function register(api) {
   api.registerTool({
     name: 'get_inventory_items',
     description:
-      '[query·兑换] 列出账号库存物品（GET /inventory，可按类型过滤、分页）。'
+      '[query·兑换] 列出账号库存物品主列表（GET /inventory，可按类型过滤、按 offset 翻页）。'
       + 'itemType 常见值：nameplate / nameplateEffect / profileEffect / iconFrame / accessory / prop / sticker / emoji / bundle / avatarlook。'
-      + '与核心 get_inventory_global（仅账号级全局物品）互补——本工具给的是完整库存视图，可用它核对兑换/领取是否真的到账。',
+      + `单次最多 ${MAX_ITEMS} 条，用 offset 翻页；返回 total（该过滤范围总数）与 hasMore。`
+      + '⚠️ 返回顺序**不保证按时间排序**，因此「核对某物品是否到账」不能只看第一页：'
+      + '优先用 type 过滤缩小范围，或按 offset 翻页直到取全/找到，否则可能静默误判成「未到账」。'
+      + '与核心 get_inventory_global（只给账号级全局物品 /inventory/global）互补——本工具给的是库存主列表。',
     inputSchema: {
       type: 'object',
       properties: {
         type: { type: 'string', description: '可选：只列该 itemType（如 nameplateEffect）' },
-        limit: { type: 'number', description: `返回条数（默认 ${DEFAULT_ITEMS}，上限 ${MAX_ITEMS}）` },
+        limit: { type: 'number', description: `返回条数（默认 ${DEFAULT_ITEMS}，单次上限 ${MAX_ITEMS}）` },
+        offset: { type: 'number', description: '可选：从第几条开始（默认 0），配合 hasMore 翻页取全量' },
       },
     },
     handler: async (args = {}) => {
       let limit = Number(args.limit);
       if (!Number.isFinite(limit) || limit <= 0) limit = DEFAULT_ITEMS;
       limit = Math.min(MAX_ITEMS, Math.round(limit));
+      let offset = Number(args.offset);
+      if (!Number.isFinite(offset) || offset < 0) offset = 0;
+      offset = Math.round(offset);
       const type = typeof args.type === 'string' && args.type.trim() ? args.type.trim() : '';
       const path = type
-        ? `/inventory?types=${encodeURIComponent(type)}&n=${limit}`
-        : `/inventory?n=${limit}`;
+        ? `/inventory?types=${encodeURIComponent(type)}&n=${limit}&offset=${offset}`
+        : `/inventory?n=${limit}&offset=${offset}`;
       try {
         const res = await api.vrchat.fetch(path);
         const items = extractInventoryList(res).map(normalizeItem);
-        return { ok: true, count: items.length, filter: type || null, items };
+        const total = extractTotalCount(res);
+        const totalKnown = Number.isFinite(total);
+        const hasMore = totalKnown ? offset + items.length < total : items.length >= limit;
+        return {
+          ok: true,
+          count: items.length,
+          total: totalKnown ? total : null,
+          offset,
+          limit,
+          hasMore,
+          filter: type || null,
+          items,
+        };
       } catch (err) {
         const e = describeError(err);
         api.log(`redeem: 库存查询失败 status=${e.status} ${e.message}`);

@@ -11,6 +11,8 @@ import register, {
   normalizeItem,
   extractRedeemedItems,
   extractInventoryList,
+  extractTotalCount,
+  extractErrors,
   isPlausibleCode,
   isPlausibleInventoryId,
   describeError,
@@ -183,6 +185,30 @@ test('redeem_code：API 失败 → ok:false 带 status，并记失败历史（�
   assert.equal(api.db.__runs[0].params.$ok, 0);
 });
 
+test('redeem_code：HTTP 200 但非空 errors → ok:false（不臆造成功，errors 透出）', async () => {
+  const { api, tools } = makeApi({
+    routes: { '/reward/redeem': { redeemedRewards: [], errors: [{ message: 'This code has already been used' }] } },
+  });
+  register(api);
+  const res = await tools.get('redeem_code').handler({ code: 'USEDCODE' });
+  assert.equal(res.ok, false);
+  assert.equal(res.count, 0);
+  assert.equal(res.errors.length, 1);
+  assert.match(res.error, /errors/);
+  assert.equal(api.db.__runs[0].params.$ok, 0);
+});
+
+test('get_redeemable_bundles：limit 参数化 + total 透出', async () => {
+  const { api, tools, calls } = makeApi({
+    routes: { '/inventory': { data: [{ id: 'inv_1', name: 'TGS', itemType: 'bundle' }], totalCount: 3 } },
+  });
+  register(api);
+  const res = await tools.get('get_redeemable_bundles').handler({ limit: 999 });
+  assert.equal(res.ok, true);
+  assert.equal(res.total, 3);
+  assert.match(calls[0].path, /n=100/);
+});
+
 test('get_redeemable_bundles：列待领礼包（带过期时间）', async () => {
   const { api, tools, calls } = makeApi({
     routes: {
@@ -223,6 +249,23 @@ test('claim_bundle：POST /inventory/{id}/consume 并返回到手物品', async 
   assert.equal(api.db.__runs[0].params.$kind, 'claim');
 });
 
+test('claim_bundle：HTTP 200 但非空 errors → ok:false（部分失败不当成功）', async () => {
+  const { api, tools } = makeApi({
+    routes: {
+      '/inventory/inv_partial': {
+        errors: [{ message: 'Item unavailable' }],
+        inventoryItems: [{ id: 'invt_x', name: 'Half', itemType: 'nameplateEffect' }],
+      },
+    },
+  });
+  register(api);
+  const res = await tools.get('claim_bundle').handler({ inventoryId: 'inv_partial' });
+  assert.equal(res.ok, false);
+  assert.equal(res.count, 1);
+  assert.equal(res.errors.length, 1);
+  assert.equal(api.db.__runs[0].params.$ok, 0);
+});
+
 test('claim_bundle：缺 id → 不调用 API；API 报错 → ok:false', async () => {
   const { api, tools, calls } = makeApi({
     routes: { '/inventory/': Object.assign(new Error('boom'), { status: 500, response: { error: { message: 'server' } } }) },
@@ -236,16 +279,35 @@ test('claim_bundle：缺 id → 不调用 API；API 报错 → ok:false', async 
   assert.equal(r2.status, 500);
 });
 
-test('get_inventory_items：type/limit 拼进查询串，limit 上限 100', async () => {
-  const { api, tools, calls } = makeApi({ routes: { '/inventory': { data: [{ id: 'invt_a', name: 'X', itemType: 'nameplateEffect' }] } } });
+test('get_inventory_items：type/limit/offset 拼进查询串，limit 上限 100，返回 total/hasMore', async () => {
+  const { api, tools, calls } = makeApi({
+    routes: { '/inventory': { data: [{ id: 'invt_a', name: 'X', itemType: 'nameplateEffect' }], totalCount: 119 } },
+  });
   register(api);
   const r1 = await tools.get('get_inventory_items').handler({ type: 'nameplateEffect', limit: 999 });
   assert.equal(r1.ok, true);
   assert.match(calls[0].path, /types=nameplateEffect/);
   assert.match(calls[0].path, /n=100/);
+  assert.match(calls[0].path, /offset=0/);
+  assert.equal(r1.total, 119);
+  assert.equal(r1.hasMore, true);            // 0 + 1 < 119
   const r2 = await tools.get('get_inventory_items').handler({});
-  assert.match(calls[1].path, /^\/inventory\?n=50$/);
+  assert.match(calls[1].path, /^\/inventory\?n=50&offset=0$/);
   assert.equal(r2.filter, null);
+  // offset 透传；翻到末页时 hasMore=false
+  const r3 = await tools.get('get_inventory_items').handler({ offset: 118, limit: 1 });
+  assert.match(calls[2].path, /offset=118/);
+  assert.equal(r3.hasMore, false);           // 118 + 1 = 119
+  // 非法 offset 回落 0
+  const r4 = await tools.get('get_inventory_items').handler({ offset: -5 });
+  assert.match(calls[3].path, /offset=0/);
+  assert.equal(r4.offset, 0);
+  // 无 totalCount 时按「返回满一页」推断 hasMore
+  const { api: api2, tools: tools2 } = makeApi({ routes: { '/inventory': { data: [{ id: 'invt_b', name: 'Y', itemType: 'prop' }] } } });
+  register(api2);
+  const r5 = await tools2.get('get_inventory_items').handler({ limit: 10 });
+  assert.equal(r5.total, null);
+  assert.equal(r5.hasMore, false);           // 1 < 10
 });
 
 test('get_redeem_history：按 kind 过滤查询本地表', async () => {
@@ -264,4 +326,26 @@ test('get_redeem_history：按 kind 过滤查询本地表', async () => {
   await tools.get('get_redeem_history').handler({ kind: 'nonsense' });
   assert.match(api.db.__alls[2].sql, /ORDER BY id DESC/);
   assert.equal(api.db.__alls[2].params.$kind, undefined);
+});
+
+// ── 纯函数（分页与 errors 判定，随审核建议新增）──────────────────────────
+test('extractTotalCount：合法返回数字，缺失/非法返回 NaN', () => {
+  assert.equal(extractTotalCount({ totalCount: 119 }), 119);
+  assert.equal(extractTotalCount({ totalCount: 0 }), 0);
+  assert.ok(Number.isNaN(extractTotalCount({})));
+  assert.ok(Number.isNaN(extractTotalCount({ totalCount: 'abc' })));
+  assert.ok(Number.isNaN(extractTotalCount(null)));
+});
+
+test('extractErrors：非数组/缺失一律空数组（不把 undefined 当失败）', () => {
+  assert.deepEqual(extractErrors({ errors: [{ message: 'x' }] }), [{ message: 'x' }]);
+  assert.deepEqual(extractErrors({ errors: [] }), []);
+  assert.deepEqual(extractErrors({}), []);
+  assert.deepEqual(extractErrors(null), []);
+});
+
+test('extractInventoryList：兼容 {data:[...]} 与裸数组，totalCount 不影响取值', () => {
+  assert.deepEqual(extractInventoryList({ data: [1], totalCount: 2 }), [1]);
+  assert.deepEqual(extractInventoryList([1, 2]), [1, 2]);
+  assert.deepEqual(extractInventoryList({}), []);
 });

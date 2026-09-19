@@ -26,7 +26,7 @@ VRChat 的免费物品（活动/联名/周年/直播掉落，中文社区戏称�
 | `redeem_code` | 提交兑换码（一次性，不可回滚） | `POST /reward/redeem` |
 | `get_redeemable_bundles` | 列出**待领取**的礼包（含过期时间） | `GET /inventory?types=bundle` |
 | `claim_bundle` | 领取（打开）礼包，内容物进库存 | `POST /inventory/{id}/consume` |
-| `get_inventory_items` | 列库存物品（可按 itemType 过滤） | `GET /inventory` |
+| `get_inventory_items` | 列库存物品主列表（可按 itemType 过滤、`offset` 翻页） | `GET /inventory` |
 | `get_redeem_history` | 本机兑换/领取历史（插件私有表） | 本地表 `plg_redeem_history` |
 
 ## 典型工作流
@@ -42,6 +42,20 @@ VRChat 的免费物品（活动/联名/周年/直播掉落，中文社区戏称�
 3. claim_bundle { "inventoryId": "inv_4f884e92-..." }
    → { ok:true, count:1, items:[{ name:"Bolt Matrix", itemType:"nameplateEffect", description:"Pure pop energy." }] }
 4. get_inventory_items { "type": "nameplateEffect" }   # 核对到账
+```
+
+> ⚠️ **两个 id 不要串用**：`redeem_code` 返回的是 `invt_*`（**模板** id），而 `claim_bundle`
+> 只接受 `get_redeemable_bundles` 给出的 `inv_*`（**库存实例** id）。拿 `invt_*` 去 consume
+> 实测会 404 `InventoryItem not found`。
+
+**库存大时要翻页（核对到账别只看第一页）：**
+
+```
+get_inventory_items { "type": "nameplateEffect", "limit": 100, "offset": 0 }
+→ { ok:true, count:100, total:119, offset:0, limit:100, hasMore:true, items:[...] }
+# hasMore=true 就继续 offset=100…… 直到 hasMore=false 或找到目标。
+# 返回顺序**不保证按时间排序**，所以「第一页没看到」≠「没到账」：
+# 要么先用 type 过滤缩小范围，要么翻页取全，别据此下「未到账」结论。
 ```
 
 **只查不收：**
@@ -60,6 +74,8 @@ get_redeem_history { "limit": 10, "kind": "redeem" }
 - **礼包图标是通用宝箱图**，不代表内容物——要知道里面是什么只有 `claim_bundle` 返回的
   `items[].name` 说了算，别拿图标或活动名反推。
 - **失败如实返回**：`{ ok:false, status, error }`（码失效/已用/拼错都会失败），绝不假装成功。
+- **`ok` 由响应 `errors` 判定**：VRChat 可能返回 **HTTP 200 + 非空 `errors[]`**（部分/全部失败），
+  此时 `ok:false` 并透出 `errors`——不要把 `ok:true, count:0` 场景当成「已到账」的证据，也不要漏读 `errors`。
 - **不接触凭据**：所有出网请求走 `api.vrchat.fetch`（核心注入登录态 + 自动限流）；
   历史表只存码/物品名/响应摘要，**不落 cookie/token**。
 - 读取不到东西时先怀疑限流与登录态：`get_server_status` 看 `auth.authenticated` 与 `ws.status`。
